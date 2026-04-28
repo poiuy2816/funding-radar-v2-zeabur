@@ -22,14 +22,180 @@ APP_TITLE = "📡 Funding Radar"
 
 
 # =========================
+# 黑色主題
+# =========================
+
+px.defaults.template = "plotly_dark"
+
+st.markdown("""
+<style>
+    /* 整體背景 */
+    .stApp {
+        background: linear-gradient(180deg, #020617 0%, #05070d 45%, #020617 100%);
+        color: #e5e7eb;
+    }
+
+    /* 頂部 header */
+    [data-testid="stHeader"] {
+        background-color: rgba(2, 6, 23, 0.85);
+        backdrop-filter: blur(8px);
+    }
+
+    [data-testid="stToolbar"] {
+        right: 2rem;
+    }
+
+    /* 文字 */
+    h1, h2, h3, h4, h5, h6 {
+        color: #f9fafb;
+        font-weight: 700;
+    }
+
+    p, span, div, label {
+        color: #e5e7eb;
+    }
+
+    /* 分隔線 */
+    hr {
+        border-color: #1f2937;
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 10px;
+        background-color: transparent;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        background-color: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 12px;
+        padding: 10px 18px;
+        color: #d1d5db;
+    }
+
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #2563eb, #0ea5e9);
+        color: white;
+        border: 1px solid #38bdf8;
+    }
+
+    /* Metric 卡片 */
+    [data-testid="stMetric"] {
+        background: linear-gradient(135deg, #0f172a, #111827);
+        border: 1px solid #1f2937;
+        padding: 18px;
+        border-radius: 16px;
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
+    }
+
+    [data-testid="stMetricLabel"] {
+        color: #9ca3af;
+    }
+
+    [data-testid="stMetricValue"] {
+        color: #38bdf8;
+        font-weight: 800;
+    }
+
+    /* DataFrame */
+    [data-testid="stDataFrame"] {
+        background-color: #0f172a;
+        border-radius: 14px;
+        border: 1px solid #1f2937;
+        overflow: hidden;
+    }
+
+    /* 按鈕 */
+    .stButton > button {
+        background: linear-gradient(135deg, #2563eb, #0ea5e9);
+        color: white;
+        border-radius: 12px;
+        border: 0px;
+        padding: 8px 18px;
+        font-weight: 700;
+    }
+
+    .stButton > button:hover {
+        background: linear-gradient(135deg, #1d4ed8, #0284c7);
+        color: white;
+        border: 0px;
+    }
+
+    /* 輸入框 */
+    input {
+        background-color: #111827 !important;
+        color: #e5e7eb !important;
+        border: 1px solid #374151 !important;
+        border-radius: 10px !important;
+    }
+
+    textarea {
+        background-color: #111827 !important;
+        color: #e5e7eb !important;
+        border: 1px solid #374151 !important;
+    }
+
+    /* Selectbox / Multiselect */
+    .stSelectbox div {
+        color: #e5e7eb;
+    }
+
+    .stMultiSelect div {
+        color: #e5e7eb;
+    }
+
+    [data-baseweb="select"] {
+        background-color: #111827;
+        border-radius: 10px;
+    }
+
+    /* Code */
+    code {
+        color: #93c5fd;
+        background-color: #111827;
+        border-radius: 6px;
+        padding: 2px 5px;
+    }
+
+    pre {
+        background-color: #111827 !important;
+        color: #e5e7eb !important;
+        border: 1px solid #1f2937;
+        border-radius: 12px;
+    }
+
+    /* Alert */
+    .stAlert {
+        background-color: #111827;
+        border-radius: 14px;
+        border: 1px solid #1f2937;
+    }
+
+    /* Caption */
+    [data-testid="stCaptionContainer"] {
+        color: #9ca3af;
+    }
+
+    /* Sidebar 若未來有用到 */
+    [data-testid="stSidebar"] {
+        background-color: #020617;
+        border-right: 1px solid #1f2937;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================
 # 資料庫路徑
 # =========================
 
 def get_db_path():
     """
     依序嘗試常見資料庫路徑。
-    如果你有在 Zeabur 設定 DB_PATH，會優先使用。
+    如果 Zeabur Variables 有設定 DB_PATH，會優先使用。
     """
+
     candidates = []
 
     env_db_path = os.getenv("DB_PATH")
@@ -37,10 +203,15 @@ def get_db_path():
         candidates.append(env_db_path)
 
     candidates.extend([
+        "/app/data/radar.db",
+        "/data/radar.db",
         "/data/funding_radar.db",
         "/app/funding_radar.db",
         "funding_radar.db",
+        "radar.db",
+        "data/radar.db",
         "data/funding_radar.db",
+        "./radar.db",
         "./funding_radar.db",
     ])
 
@@ -48,8 +219,7 @@ def get_db_path():
         if path and Path(path).exists():
             return path
 
-    # 如果都不存在，回傳第一個預設值
-    return env_db_path or "/data/funding_radar.db"
+    return env_db_path or "/app/data/radar.db"
 
 
 DB_PATH = get_db_path()
@@ -172,7 +342,6 @@ def add_time_column(df):
         return df
 
     if "timestamp" in df.columns:
-        # 如果 timestamp 很大，可能是毫秒；否則當秒
         timestamp_numeric = pd.to_numeric(df["timestamp"], errors="coerce")
         if timestamp_numeric.dropna().empty:
             df["time"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -200,11 +369,21 @@ def existing_cols(df, cols):
     return [col for col in cols if col in df.columns]
 
 
-def format_rate_columns_for_display(df):
-    """
-    只做顯示輔助，不改原始圖表數值。
-    """
-    return df
+def status_count(df, target_status):
+    if df.empty or "status" not in df.columns:
+        return 0
+    return int((df["status"].astype(str).str.upper() == target_status.upper()).sum())
+
+
+def fmt_latest_time(df):
+    if df.empty or "time" not in df.columns:
+        return "-"
+
+    latest_time = df["time"].dropna()
+    if latest_time.empty:
+        return "-"
+
+    return str(latest_time.max())[:19]
 
 
 # =========================
@@ -220,12 +399,11 @@ if not check_password():
 # =========================
 
 st.title(APP_TITLE)
-
 st.caption(f"Database path: `{DB_PATH}`")
 
 
 # =========================
-# 資料庫狀態
+# 資料庫狀態檢查
 # =========================
 
 if not Path(DB_PATH).exists():
@@ -247,16 +425,41 @@ if not columns:
 
 
 # =========================
+# 共用數字欄位
+# =========================
+
+numeric_cols = [
+    "current_funding_rate",
+    "avg_funding_rate_7d",
+    "std_funding_rate_7d",
+    "positive_ratio_7d",
+    "recent_avg_funding_rate",
+    "apy",
+    "basis_rate",
+    "spot_slippage",
+    "futures_slippage",
+    "total_slippage",
+    "total_slippage_rate",
+    "payback_days",
+    "score",
+    "open_interest_notional",
+    "quote_volume",
+    "quote_volume_24h",
+    "volume_24h",
+    "mark_price",
+    "index_price",
+]
+
+
+# =========================
 # 讀取最新資料
 # =========================
 
-order_col = "ts" if "ts" in columns else None
-
-if order_col:
+if "ts" in columns:
     latest_df = read_sql("""
         SELECT *
         FROM scan_results
-        ORDER BY ts DESC
+        ORDER BY ts DESC, id DESC
         LIMIT 1000
     """)
 else:
@@ -267,23 +470,6 @@ else:
     """)
 
 latest_df = add_time_column(latest_df)
-
-
-numeric_cols = [
-    "current_funding_rate",
-    "avg_funding_rate_7d",
-    "basis_rate",
-    "total_slippage",
-    "total_slippage_rate",
-    "payback_days",
-    "score",
-    "open_interest_notional",
-    "quote_volume_24h",
-    "volume_24h",
-    "mark_price",
-    "index_price",
-]
-
 latest_df = safe_to_numeric(latest_df, numeric_cols)
 
 
@@ -292,18 +478,9 @@ latest_df = safe_to_numeric(latest_df, numeric_cols)
 # =========================
 
 total_count = len(latest_df)
-
-watch_count = 0
-pass_count = 0
-
-if not latest_df.empty:
-    if "signal" in latest_df.columns:
-        watch_count = int((latest_df["signal"].astype(str).str.upper() == "WATCH").sum())
-        pass_count = int((latest_df["signal"].astype(str).str.upper() == "PASS").sum())
-    elif "status" in latest_df.columns:
-        watch_count = int((latest_df["status"].astype(str).str.upper() == "WATCH").sum())
-        pass_count = int((latest_df["status"].astype(str).str.upper() == "PASS").sum())
-
+pass_count = status_count(latest_df, "PASS")
+watch_count = status_count(latest_df, "WATCH")
+fail_count = status_count(latest_df, "FAIL")
 
 m1, m2, m3, m4 = st.columns(4)
 
@@ -311,20 +488,13 @@ with m1:
     st.metric("最新資料筆數", total_count)
 
 with m2:
-    st.metric("WATCH", watch_count)
-
-with m3:
     st.metric("PASS", pass_count)
 
+with m3:
+    st.metric("WATCH", watch_count)
+
 with m4:
-    if not latest_df.empty and "time" in latest_df.columns:
-        latest_time = latest_df["time"].dropna()
-        if not latest_time.empty:
-            st.metric("最後更新", str(latest_time.max())[:19])
-        else:
-            st.metric("最後更新", "-")
-    else:
-        st.metric("最後更新", "-")
+    st.metric("最後更新", fmt_latest_time(latest_df))
 
 
 st.divider()
@@ -354,11 +524,7 @@ with tab_watch:
     else:
         watch_df = pd.DataFrame()
 
-        if "signal" in latest_df.columns:
-            watch_df = latest_df[
-                latest_df["signal"].astype(str).str.upper() == "WATCH"
-            ].copy()
-        elif "status" in latest_df.columns:
+        if "status" in latest_df.columns:
             watch_df = latest_df[
                 latest_df["status"].astype(str).str.upper() == "WATCH"
             ].copy()
@@ -369,18 +535,18 @@ with tab_watch:
             display_cols = existing_cols(watch_df, [
                 "time",
                 "symbol",
-                "signal",
                 "status",
-                "score",
+                "signal_level",
                 "current_funding_rate",
                 "avg_funding_rate_7d",
+                "apy",
+                "payback_days",
                 "basis_rate",
                 "total_slippage",
-                "total_slippage_rate",
-                "payback_days",
+                "quote_volume",
                 "open_interest_notional",
-                "quote_volume_24h",
-                "volume_24h",
+                "mark_price",
+                "fail_reason",
             ])
 
             if display_cols:
@@ -405,40 +571,58 @@ with tab_latest:
     if latest_df.empty:
         st.info("目前沒有掃描資料。")
     else:
-        filter_symbol = None
+        latest_view = latest_df.copy()
 
-        if "symbol" in latest_df.columns:
-            symbols = sorted(latest_df["symbol"].dropna().astype(str).unique().tolist())
-            selected = st.multiselect(
-                "篩選 Symbol",
-                options=symbols,
-                default=[],
-            )
+        c_filter1, c_filter2 = st.columns(2)
 
-            if selected:
-                latest_view = latest_df[latest_df["symbol"].astype(str).isin(selected)].copy()
-            else:
-                latest_view = latest_df.copy()
-        else:
-            latest_view = latest_df.copy()
+        with c_filter1:
+            if "symbol" in latest_view.columns:
+                symbols = sorted(latest_view["symbol"].dropna().astype(str).unique().tolist())
+                selected_symbols = st.multiselect(
+                    "篩選 Symbol",
+                    options=symbols,
+                    default=[],
+                )
+
+                if selected_symbols:
+                    latest_view = latest_view[
+                        latest_view["symbol"].astype(str).isin(selected_symbols)
+                    ].copy()
+
+        with c_filter2:
+            if "status" in latest_view.columns:
+                statuses = sorted(latest_view["status"].dropna().astype(str).unique().tolist())
+                selected_statuses = st.multiselect(
+                    "篩選 Status",
+                    options=statuses,
+                    default=[],
+                )
+
+                if selected_statuses:
+                    latest_view = latest_view[
+                        latest_view["status"].astype(str).isin(selected_statuses)
+                    ].copy()
 
         display_cols = existing_cols(latest_view, [
             "time",
             "symbol",
-            "signal",
             "status",
-            "score",
+            "signal_level",
             "current_funding_rate",
             "avg_funding_rate_7d",
-            "basis_rate",
-            "total_slippage",
-            "total_slippage_rate",
+            "std_funding_rate_7d",
+            "positive_ratio_7d",
+            "recent_avg_funding_rate",
+            "apy",
             "payback_days",
+            "basis_rate",
+            "spot_slippage",
+            "futures_slippage",
+            "total_slippage",
+            "quote_volume",
             "open_interest_notional",
-            "quote_volume_24h",
-            "volume_24h",
             "mark_price",
-            "index_price",
+            "fail_reason",
         ])
 
         if display_cols:
@@ -463,32 +647,27 @@ with tab_history:
     if "symbol" not in columns:
         st.warning("scan_results 裡沒有 `symbol` 欄位，無法顯示歷史走勢。")
     else:
-        if "ts" in columns:
-            symbols_df = read_sql("""
-                SELECT DISTINCT symbol
-                FROM scan_results
-                WHERE symbol IS NOT NULL
-                ORDER BY symbol ASC
-            """)
-        else:
-            symbols_df = read_sql("""
-                SELECT DISTINCT symbol
-                FROM scan_results
-                WHERE symbol IS NOT NULL
-                ORDER BY symbol ASC
-            """)
+        symbols_df = read_sql("""
+            SELECT DISTINCT symbol
+            FROM scan_results
+            WHERE symbol IS NOT NULL
+            ORDER BY symbol ASC
+        """)
 
         if symbols_df.empty:
             st.info("尚無歷史資料。")
         else:
-            symbol = st.selectbox("選擇 Symbol", symbols_df["symbol"].astype(str).tolist())
+            symbol = st.selectbox(
+                "選擇 Symbol",
+                symbols_df["symbol"].astype(str).tolist(),
+            )
 
             if "ts" in columns:
                 hist = read_sql("""
                     SELECT *
                     FROM scan_results
                     WHERE symbol=?
-                    ORDER BY ts ASC
+                    ORDER BY ts ASC, id ASC
                 """, [symbol])
             else:
                 hist = read_sql("""
@@ -503,7 +682,6 @@ with tab_history:
                 hist = add_time_column(hist)
 
                 # 重要：修正 Plotly 型別錯誤
-                # SQLite 讀出來的數字欄位有時會變成文字，必須轉成 numeric。
                 hist = safe_to_numeric(hist, numeric_cols)
 
                 c1, c2 = st.columns(2)
@@ -521,6 +699,11 @@ with tab_history:
                             y=y_cols,
                             title=f"{symbol} Funding Rate",
                         )
+                        fig.update_layout(
+                            paper_bgcolor="#020617",
+                            plot_bgcolor="#020617",
+                            font_color="#e5e7eb",
+                        )
                         st.plotly_chart(fig, use_container_width=True)
                     else:
                         st.info("目前沒有 Funding Rate 資料可繪圖。")
@@ -532,6 +715,11 @@ with tab_history:
                             x="time",
                             y="payback_days",
                             title=f"{symbol} Payback Days",
+                        )
+                        fig.update_layout(
+                            paper_bgcolor="#020617",
+                            plot_bgcolor="#020617",
+                            font_color="#e5e7eb",
                         )
                         st.plotly_chart(fig, use_container_width=True)
                     else:
@@ -546,6 +734,11 @@ with tab_history:
                             x="time",
                             y="basis_rate",
                             title=f"{symbol} Basis",
+                        )
+                        fig.update_layout(
+                            paper_bgcolor="#020617",
+                            plot_bgcolor="#020617",
+                            font_color="#e5e7eb",
                         )
                         st.plotly_chart(fig, use_container_width=True)
                     else:
@@ -566,6 +759,11 @@ with tab_history:
                             y=slippage_col,
                             title=f"{symbol} Total Slippage",
                         )
+                        fig.update_layout(
+                            paper_bgcolor="#020617",
+                            plot_bgcolor="#020617",
+                            font_color="#e5e7eb",
+                        )
                         st.plotly_chart(fig, use_container_width=True)
                     else:
                         st.info("目前沒有 Total Slippage 資料可繪圖。")
@@ -575,20 +773,23 @@ with tab_history:
                 display_cols = existing_cols(hist, [
                     "time",
                     "symbol",
-                    "signal",
                     "status",
-                    "score",
+                    "signal_level",
                     "current_funding_rate",
                     "avg_funding_rate_7d",
-                    "basis_rate",
-                    "total_slippage",
-                    "total_slippage_rate",
+                    "std_funding_rate_7d",
+                    "positive_ratio_7d",
+                    "recent_avg_funding_rate",
+                    "apy",
                     "payback_days",
+                    "basis_rate",
+                    "spot_slippage",
+                    "futures_slippage",
+                    "total_slippage",
+                    "quote_volume",
                     "open_interest_notional",
-                    "quote_volume_24h",
-                    "volume_24h",
                     "mark_price",
-                    "index_price",
+                    "fail_reason",
                 ])
 
                 if display_cols:
@@ -619,12 +820,32 @@ with tab_db:
         use_container_width=True,
     )
 
-    try:
-        count_df = read_sql("SELECT COUNT(*) AS count FROM scan_results")
-        if not count_df.empty:
-            st.metric("scan_results 總筆數", int(count_df["count"].iloc[0]))
-    except Exception as e:
-        st.error(f"統計資料筆數失敗：{e}")
+    count_df = read_sql("SELECT COUNT(*) AS count FROM scan_results")
+    if not count_df.empty and "count" in count_df.columns:
+        st.metric("scan_results 總筆數", int(count_df["count"].iloc[0]))
+
+    if "status" in columns:
+        status_df = read_sql("""
+            SELECT status, COUNT(*) AS count
+            FROM scan_results
+            GROUP BY status
+            ORDER BY count DESC
+        """)
+
+        st.write("狀態統計：")
+        st.dataframe(status_df, use_container_width=True)
+
+    if "symbol" in columns:
+        symbol_df = read_sql("""
+            SELECT symbol, COUNT(*) AS count
+            FROM scan_results
+            GROUP BY symbol
+            ORDER BY count DESC
+            LIMIT 30
+        """)
+
+        st.write("資料最多的 Symbol：")
+        st.dataframe(symbol_df, use_container_width=True)
 
     st.write("資料表清單：")
     tables_df = read_sql("""
