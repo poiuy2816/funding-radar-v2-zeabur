@@ -228,65 +228,85 @@ with tab2:
     ORDER BY symbol
     """)
 
-    if symbols_df.empty:
-        st.info("尚無歷史資料。")
-    else:
-        symbol = st.selectbox("選擇 Symbol", symbols_df["symbol"].tolist())
-
-        hist = read_sql("""
-        SELECT *
-        FROM scan_results
-        WHERE symbol=?
-        ORDER BY ts ASC
-        """, [symbol])
-
         if hist.empty:
             st.info("沒有資料")
         else:
-            hist["time"] = pd.to_datetime(hist["ts"], unit="s")
+            hist["time"] = pd.to_datetime(hist["ts"], unit="s", errors="coerce")
+
+            # SQLite 讀出來的數字欄位有時會變成文字，Plotly 會因此報錯
+            numeric_cols = [
+                "current_funding_rate",
+                "avg_funding_rate_7d",
+                "payback_days",
+                "basis_rate",
+                "total_slippage",
+            ]
+
+            for col in numeric_cols:
+                if col in hist.columns:
+                    hist[col] = pd.to_numeric(hist[col], errors="coerce")
 
             c1, c2 = st.columns(2)
 
             with c1:
-                fig = px.line(
-                    hist,
-                    x="time",
-                    y=["current_funding_rate", "avg_funding_rate_7d"],
-                    title=f"{symbol} Funding Rate"
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                y_cols = [
+                    col for col in [
+                        "current_funding_rate",
+                        "avg_funding_rate_7d",
+                    ]
+                    if col in hist.columns
+                ]
+
+                if y_cols:
+                    fig = px.line(
+                        hist,
+                        x="time",
+                        y=y_cols,
+                        title=f"{symbol} Funding Rate"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("目前沒有 Funding Rate 資料可繪圖。")
 
             with c2:
-                fig = px.line(
-                    hist,
-                    x="time",
-                    y="payback_days",
-                    title=f"{symbol} Payback Days"
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                if "payback_days" in hist.columns:
+                    fig = px.line(
+                        hist,
+                        x="time",
+                        y="payback_days",
+                        title=f"{symbol} Payback Days"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("目前沒有 Payback Days 資料可繪圖。")
 
             c3, c4 = st.columns(2)
 
             with c3:
-                fig = px.line(
-                    hist,
-                    x="time",
-                    y="basis_rate",
-                    title=f"{symbol} Basis"
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                if "basis_rate" in hist.columns:
+                    fig = px.line(
+                        hist,
+                        x="time",
+                        y="basis_rate",
+                        title=f"{symbol} Basis"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("目前沒有 Basis 資料可繪圖。")
 
             with c4:
-                fig = px.line(
-                    hist,
-                    x="time",
-                    y="total_slippage",
-                    title=f"{symbol} Total Slippage"
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                if "total_slippage" in hist.columns:
+                    fig = px.line(
+                        hist,
+                        x="time",
+                        y="total_slippage",
+                        title=f"{symbol} Total Slippage"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("目前沒有 Total Slippage 資料可繪圖。")
 
             st.dataframe(hist.tail(100), use_container_width=True)
-
 
 # =========================
 # Tab 3
