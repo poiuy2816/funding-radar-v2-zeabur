@@ -844,35 +844,81 @@ class Telegram:
             "<code>/order SOLUSDT 50</code>"
         )
 
-    async def cmd_top(self):
+        async def cmd_top(self):
+        """
+        顯示目前最新 PASS 訊號。
+        修正版重點：
+        1. 每個 symbol 只顯示最新一筆
+        2. 不會一直重複 DOGEUSDT
+        3. 只看最近 24 小時內的資料，避免太舊的 PASS 訊號殘留
+        4. 依照回本天數由低到高排序
+        """
+
+        lookback_seconds = 24 * 60 * 60
+        since_ts = now_ts() - lookback_seconds
+
         with self.db.conn() as con:
             con.row_factory = sqlite3.Row
             rows = con.execute("""
+            WITH ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY ts DESC, id DESC
+                    ) AS rn
+                FROM scan_results
+                WHERE ts >= ?
+            )
             SELECT *
-            FROM scan_results
-            WHERE status='PASS'
-            ORDER BY ts DESC, payback_days ASC
+            FROM ranked
+            WHERE rn = 1
+              AND UPPER(status) = 'PASS'
+            ORDER BY
+                COALESCE(payback_days, 999999) ASC,
+                COALESCE(apy, 0) DESC
             LIMIT 10
-            """).fetchall()
+            """, (since_ts,)).fetchall()
 
         if not rows:
-            await self.send("目前沒有 PASS 訊號")
+            await self.send(
+                "目前沒有 PASS 訊號\n\n"
+                "說明：新版 /top 只顯示最近 24 小時內，且每個幣種最新一筆仍為 PASS 的標的。"
+            )
             return
 
-        lines = ["🏆 <b>最新 PASS 訊號</b>"]
+        lines = [
+            "🏆 <b>最新 PASS 訊號</b>",
+            "<code>每個幣種只顯示最新一筆｜最近 24 小時</code>",
+        ]
 
-        for r in rows:
+        for i, r in enumerate(rows, 1):
+            symbol = r["symbol"]
+            signal_level = r["signal_level"] or "✅ 可觀察"
+
+            payback_days = r["payback_days"]
+            payback_text = f"{payback_days:.2f} 天" if payback_days is not None else "N/A"
+
+            ts_value = r["ts"]
+            try:
+                time_text = datetime.fromtimestamp(int(ts_value), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            except Exception:
+                time_text = "N/A"
+
             lines.append(
-                f"\n<b>{r['symbol']}</b>｜{r['signal_level']}\n"
+                f"\n#{i} <b>{symbol}</b>｜{signal_level}\n"
+                f"時間：<code>{time_text}</code>\n"
                 f"當前費率：{fmt_pct(r['current_funding_rate'])}\n"
                 f"7日平均：{fmt_pct(r['avg_funding_rate_7d'])}\n"
                 f"APY：{fmt_pct(r['apy'], 2)}\n"
-                f"回本：{r['payback_days']:.2f} 天\n"
+                f"回本：{payback_text}\n"
                 f"Basis：{fmt_pct(r['basis_rate'])}\n"
-                f"半自動：<code>/order {r['symbol']} {DEFAULT_ORDER_NOTIONAL_USDT}</code>"
+                f"總滑點：{fmt_pct(r['total_slippage'])}\n"
+                f"半自動：<code>/order {symbol} {DEFAULT_ORDER_NOTIONAL_USDT}</code>"
             )
 
         await self.send("\n".join(lines))
+
 
     async def cmd_order(self, symbol: str, notional: float):
         if notional <= 0 or notional > MAX_ORDER_NOTIONAL_USDT:
