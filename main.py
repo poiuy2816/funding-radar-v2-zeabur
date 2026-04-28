@@ -844,16 +844,7 @@ class Telegram:
             "<code>/order SOLUSDT 50</code>"
         )
 
-        async def cmd_top(self):
-        """
-        顯示目前最新 PASS 訊號。
-        修正版重點：
-        1. 每個 symbol 只顯示最新一筆
-        2. 不會一直重複 DOGEUSDT
-        3. 只看最近 24 小時內的資料，避免太舊的 PASS 訊號殘留
-        4. 依照回本天數由低到高排序
-        """
-
+    async def cmd_top(self):
         lookback_seconds = 24 * 60 * 60
         since_ts = now_ts() - lookback_seconds
 
@@ -918,7 +909,6 @@ class Telegram:
             )
 
         await self.send("\n".join(lines))
-
 
     async def cmd_order(self, symbol: str, notional: float):
         if notional <= 0 or notional > MAX_ORDER_NOTIONAL_USDT:
