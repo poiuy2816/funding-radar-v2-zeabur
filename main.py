@@ -2,6 +2,7 @@ import os
 import json
 import time
 import hmac
+import html
 import math
 import hashlib
 import sqlite3
@@ -73,6 +74,8 @@ DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 MAX_ORDER_NOTIONAL_USDT = float(os.getenv("MAX_ORDER_NOTIONAL_USDT", "100"))
 DEFAULT_ORDER_NOTIONAL_USDT = float(os.getenv("DEFAULT_ORDER_NOTIONAL_USDT", "50"))
 DEFAULT_FUTURES_LEVERAGE = int(os.getenv("DEFAULT_FUTURES_LEVERAGE", "1"))
+
+TARGET_APY = float(os.getenv("TARGET_APY", "0.16"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -712,6 +715,10 @@ class Telegram:
         self.trader = trader
         self.offset = 0
 
+    # =========================
+    # Telegram 基礎工具
+    # =========================
+
     async def send(self, text: str) -> bool:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.warning("Telegram env 未設定，略過發送")
@@ -735,6 +742,82 @@ class Telegram:
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
             return False
+
+    def h(self, x: Any) -> str:
+        """
+        HTML escape，避免 Telegram HTML parse_mode 因特殊字元壞掉。
+        """
+        if x is None:
+            return ""
+        return html.escape(str(x))
+
+    def row_get(self, row: sqlite3.Row, key: str, default=None):
+        try:
+            if key in row.keys():
+                return row[key]
+        except Exception:
+            pass
+        return default
+
+    def fmt_time(self, ts_value) -> str:
+        try:
+            return datetime.fromtimestamp(int(ts_value), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            return "N/A"
+
+    def fmt_days(self, x) -> str:
+        try:
+            if x is None:
+                return "N/A"
+            return f"{float(x):.2f} 天"
+        except Exception:
+            return "N/A"
+
+    def fmt_money(self, x) -> str:
+        try:
+            if x is None:
+                return "N/A"
+            return f"{float(x):,.0f}"
+        except Exception:
+            return "N/A"
+
+    def fmt_price(self, x) -> str:
+        try:
+            if x is None:
+                return "N/A"
+            return f"{float(x):,.8f}"
+        except Exception:
+            return "N/A"
+
+    def status_text(self, status: str) -> str:
+        text = str(status).upper()
+
+        if text == "PASS":
+            return "✅ 通過"
+        if text == "WATCH":
+            return "⚠️ 觀察"
+        if text == "FAIL":
+            return "❌ 未通過"
+
+        return self.h(status)
+
+    def target_text(self, apy) -> str:
+        if apy is None:
+            return "無法判斷，因為年化收益率尚未計算"
+
+        try:
+            apy_value = float(apy)
+            gap = apy_value - TARGET_APY
+
+            if gap >= 0:
+                return f"🔥 已達標，超過 {gap * 100:.2f}%"
+            return f"尚未達標，還差 {abs(gap) * 100:.2f}%"
+        except Exception:
+            return "無法判斷"
+
+    # =========================
+    # Telegram Polling
+    # =========================
 
     async def poll_loop(self):
         if not TELEGRAM_BOT_TOKEN:
@@ -772,8 +855,15 @@ class Telegram:
             if text:
                 await self.handle(text)
 
+    # =========================
+    # 指令入口
+    # =========================
+
     async def handle(self, text: str):
         parts = text.split()
+        if not parts:
+            return
+
         cmd = parts[0].lower()
 
         try:
@@ -781,35 +871,43 @@ class Telegram:
                 await self.send(self.help_text())
 
             elif cmd == "/status":
-                await self.send(
-                    "📡 <b>Radar Status</b>\n"
-                    f"scanner_paused: <code>{self.db.get_setting('scanner_paused','false')}</code>\n"
-                    f"ENABLE_TRADING: <code>{ENABLE_TRADING}</code>\n"
-                    f"DRY_RUN: <code>{DRY_RUN}</code>\n"
-                    f"DB_PATH: <code>{DB_PATH}</code>"
-                )
+                await self.cmd_status()
 
             elif cmd == "/pause":
                 self.db.set_setting("scanner_paused", "true")
-                await self.send("⏸ 已暫停掃描")
+                await self.send("⏸ <b>已暫停掃描</b>")
 
             elif cmd == "/resume":
                 self.db.set_setting("scanner_paused", "false")
-                await self.send("▶️ 已恢復掃描")
+                await self.send("▶️ <b>已恢復掃描</b>")
 
             elif cmd == "/top":
                 await self.cmd_top()
+
+            elif cmd == "/top16":
+                await self.cmd_top16()
+
+            elif cmd == "/why" and len(parts) >= 2:
+                symbol = norm_symbol(parts[1])
+                await self.cmd_why(symbol)
 
             elif cmd == "/blacklist_add" and len(parts) >= 2:
                 symbol = norm_symbol(parts[1])
                 reason = " ".join(parts[2:]) if len(parts) > 2 else "telegram"
                 self.db.add_blacklist(symbol, reason)
-                await self.send(f"✅ 已加入黑名單：<b>{symbol}</b>")
+                await self.send(
+                    f"🚫 <b>已加入黑名單</b>\n\n"
+                    f"交易對：<b>{self.h(symbol)}</b>\n"
+                    f"原因：<code>{self.h(reason)}</code>"
+                )
 
             elif cmd == "/blacklist_remove" and len(parts) >= 2:
                 symbol = norm_symbol(parts[1])
                 self.db.remove_blacklist(symbol)
-                await self.send(f"✅ 已移除黑名單：<b>{symbol}</b>")
+                await self.send(
+                    f"✅ <b>已移除黑名單</b>\n\n"
+                    f"交易對：<b>{self.h(symbol)}</b>"
+                )
 
             elif cmd == "/order" and len(parts) >= 2:
                 symbol = norm_symbol(parts[1])
@@ -823,26 +921,98 @@ class Telegram:
                 await self.cmd_cancel(parts[1].upper())
 
             else:
-                await self.send("未知指令，請輸入 /help")
+                await self.send(
+                    "未知指令，請輸入 /help 查看可用指令。\n\n"
+                    "常用指令：\n"
+                    "<code>/top</code>\n"
+                    "<code>/top16</code>\n"
+                    "<code>/why ETHUSDT</code>"
+                )
 
         except Exception as e:
-            await self.send(f"❌ 指令錯誤：<code>{e}</code>")
+            logger.exception(f"Telegram command error: {e}")
+            await self.send(f"❌ <b>指令錯誤</b>\n\n<code>{self.h(e)}</code>")
+
+    # =========================
+    # 說明與狀態
+    # =========================
 
     def help_text(self) -> str:
         return (
-            "🤖 <b>Funding Radar 指令</b>\n\n"
-            "/status - 查看狀態\n"
-            "/top - 查看最新 PASS 訊號\n"
+            "🤖 <b>Funding Radar 指令說明</b>\n\n"
+
+            "📊 <b>監控查詢</b>\n"
+            "/status - 查看系統狀態\n"
+            "/top - 查看目前最新通過訊號\n"
+            "/top16 - 查看達到目標年化的訊號\n"
+            "/why SYMBOL - 查看某交易對為什麼通過或未通過\n\n"
+
+            "⏸ <b>掃描控制</b>\n"
             "/pause - 暫停掃描\n"
-            "/resume - 恢復掃描\n"
+            "/resume - 恢復掃描\n\n"
+
+            "🚫 <b>黑名單</b>\n"
             "/blacklist_add SYMBOL reason - 加入黑名單\n"
-            "/blacklist_remove SYMBOL - 移除黑名單\n"
+            "/blacklist_remove SYMBOL - 移除黑名單\n\n"
+
+            "📝 <b>半自動下單</b>\n"
             "/order SYMBOL amount - 建立半自動下單意圖\n"
             "/confirm CODE - 確認下單意圖\n"
             "/cancel CODE - 取消下單意圖\n\n"
-            "範例：\n"
-            "<code>/order SOLUSDT 50</code>"
+
+            "📌 <b>範例</b>\n"
+            "<code>/top</code>\n"
+            "<code>/top16</code>\n"
+            "<code>/why ETHUSDT</code>\n"
+            "<code>/order DOGEUSDT 50</code>\n\n"
+
+            f"🎯 目前目標年化：<b>{TARGET_APY * 100:.2f}%</b>\n\n"
+            "⚠️ 訊號僅供監控，不代表投資建議。"
         )
+
+    async def cmd_status(self):
+        scanner_paused = self.db.get_setting("scanner_paused", "false")
+        telegram_paused = self.db.get_setting("telegram_paused", "false")
+
+        with self.db.conn() as con:
+            scan_count = con.execute("SELECT COUNT(*) FROM scan_results").fetchone()[0]
+
+            latest_ts_row = con.execute("""
+                SELECT MAX(ts)
+                FROM scan_results
+            """).fetchone()
+
+            latest_ts = latest_ts_row[0] if latest_ts_row else None
+
+            pass_count = con.execute("""
+                SELECT COUNT(*)
+                FROM scan_results
+                WHERE status='PASS'
+            """).fetchone()[0]
+
+            watch_count = con.execute("""
+                SELECT COUNT(*)
+                FROM scan_results
+                WHERE status='WATCH'
+            """).fetchone()[0]
+
+        await self.send(
+            "📡 <b>Funding Radar 系統狀態</b>\n\n"
+            f"掃描狀態：<code>{'暫停' if scanner_paused.lower() == 'true' else '運行中'}</code>\n"
+            f"Telegram 狀態：<code>{'暫停' if telegram_paused.lower() == 'true' else '運行中'}</code>\n"
+            f"是否允許實盤交易：<code>{ENABLE_TRADING}</code>\n"
+            f"是否模擬交易 DRY_RUN：<code>{DRY_RUN}</code>\n"
+            f"目標年化：<b>{TARGET_APY * 100:.2f}%</b>\n"
+            f"資料庫路徑：<code>{self.h(DB_PATH)}</code>\n\n"
+            f"scan_results 總筆數：<b>{scan_count}</b>\n"
+            f"歷史 PASS 筆數：<b>{pass_count}</b>\n"
+            f"歷史 WATCH 筆數：<b>{watch_count}</b>\n"
+            f"最後更新：<code>{self.fmt_time(latest_ts)}</code>"
+        )
+
+    # =========================
+    # /top 最新通過訊號
+    # =========================
 
     async def cmd_top(self):
         lookback_seconds = 24 * 60 * 60
@@ -873,66 +1043,234 @@ class Telegram:
 
         if not rows:
             await self.send(
-                "目前沒有 PASS 訊號\n\n"
-                "說明：新版 /top 只顯示最近 24 小時內，且每個幣種最新一筆仍為 PASS 的標的。"
+                "目前沒有通過訊號。\n\n"
+                "說明：/top 只顯示最近 24 小時內，"
+                "每個交易對最新一筆仍為 PASS 的標的。"
             )
             return
 
         lines = [
-            "🏆 <b>最新 PASS 訊號</b>",
-            "<code>每個幣種只顯示最新一筆｜最近 24 小時</code>",
+            "🏆 <b>最新通過訊號</b>",
+            "<code>每個交易對只顯示最新一筆｜最近 24 小時</code>",
+            f"目標年化：<b>{TARGET_APY * 100:.2f}%</b>",
         ]
 
         for i, r in enumerate(rows, 1):
-            symbol = r["symbol"]
-            signal_level = r["signal_level"] or "✅ 可觀察"
-
-            payback_days = r["payback_days"]
-            payback_text = f"{payback_days:.2f} 天" if payback_days is not None else "N/A"
-
-            ts_value = r["ts"]
-            try:
-                time_text = datetime.fromtimestamp(int(ts_value), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            except Exception:
-                time_text = "N/A"
+            symbol = self.row_get(r, "symbol", "")
+            signal_level = self.row_get(r, "signal_level", "") or "✅ 可觀察"
 
             lines.append(
-                f"\n#{i} <b>{symbol}</b>｜{signal_level}\n"
-                f"時間：<code>{time_text}</code>\n"
-                f"當前費率：{fmt_pct(r['current_funding_rate'])}\n"
-                f"7日平均：{fmt_pct(r['avg_funding_rate_7d'])}\n"
-                f"APY：{fmt_pct(r['apy'], 2)}\n"
-                f"回本：{payback_text}\n"
-                f"Basis：{fmt_pct(r['basis_rate'])}\n"
-                f"總滑點：{fmt_pct(r['total_slippage'])}\n"
-                f"半自動：<code>/order {symbol} {DEFAULT_ORDER_NOTIONAL_USDT}</code>"
+                f"\n#{i} <b>{self.h(symbol)}</b>｜{self.h(signal_level)}\n"
+                f"時間：<code>{self.fmt_time(self.row_get(r, 'ts'))}</code>\n"
+                f"當前資金費率：{fmt_pct(self.row_get(r, 'current_funding_rate'))}\n"
+                f"7日平均資金費率：{fmt_pct(self.row_get(r, 'avg_funding_rate_7d'))}\n"
+                f"年化收益率：<b>{fmt_pct(self.row_get(r, 'apy'), 2)}</b>\n"
+                f"16% 目標：<b>{self.target_text(self.row_get(r, 'apy'))}</b>\n"
+                f"回本天數：{self.fmt_days(self.row_get(r, 'payback_days'))}\n"
+                f"現貨合約價差：{fmt_pct(self.row_get(r, 'basis_rate'))}\n"
+                f"總滑點：{fmt_pct(self.row_get(r, 'total_slippage'))}\n"
+                f"24H 成交額：<code>{self.fmt_money(self.row_get(r, 'quote_volume'))}</code>\n"
+                f"合約未平倉名目價值：<code>{self.fmt_money(self.row_get(r, 'open_interest_notional'))}</code>\n"
+                f"半自動：<code>/order {self.h(symbol)} {DEFAULT_ORDER_NOTIONAL_USDT}</code>\n"
+                f"原因查詢：<code>/why {self.h(symbol)}</code>"
             )
 
         await self.send("\n".join(lines))
 
+    # =========================
+    # /top16 目標年化訊號
+    # =========================
+
+    async def cmd_top16(self):
+        lookback_seconds = 24 * 60 * 60
+        since_ts = now_ts() - lookback_seconds
+
+        with self.db.conn() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("""
+            WITH ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY ts DESC, id DESC
+                    ) AS rn
+                FROM scan_results
+                WHERE ts >= ?
+            )
+            SELECT *
+            FROM ranked
+            WHERE rn = 1
+              AND apy IS NOT NULL
+              AND apy >= ?
+            ORDER BY
+                apy DESC,
+                COALESCE(payback_days, 999999) ASC
+            LIMIT 10
+            """, (since_ts, TARGET_APY)).fetchall()
+
+        if not rows:
+            await self.send(
+                "🔥 <b>目標年化訊號</b>\n\n"
+                f"目前沒有交易對達到目標年化 <b>{TARGET_APY * 100:.2f}%</b>。\n\n"
+                "這通常代表：\n"
+                "- 目前市場資金費率不夠高\n"
+                "- 或 funding 高的標的被 Basis、滑點、成交量、OI、穩定性條件過濾掉\n\n"
+                "你可以用：\n"
+                "<code>/top</code> 查看一般通過訊號\n"
+                "<code>/why ETHUSDT</code> 查單一交易對原因"
+            )
+            return
+
+        lines = [
+            "🔥 <b>目標年化訊號</b>",
+            "<code>每個交易對只顯示最新一筆｜最近 24 小時</code>",
+            f"目標年化：<b>{TARGET_APY * 100:.2f}%</b>",
+        ]
+
+        for i, r in enumerate(rows, 1):
+            symbol = self.row_get(r, "symbol", "")
+            apy = self.row_get(r, "apy")
+            gap_text = "N/A"
+
+            try:
+                gap = float(apy) - TARGET_APY
+                gap_text = f"+{gap * 100:.2f}%" if gap >= 0 else f"{gap * 100:.2f}%"
+            except Exception:
+                pass
+
+            lines.append(
+                f"\n#{i} <b>{self.h(symbol)}</b>｜🔥 已達標\n"
+                f"時間：<code>{self.fmt_time(self.row_get(r, 'ts'))}</code>\n"
+                f"年化收益率：<b>{fmt_pct(apy, 2)}</b>\n"
+                f"超過目標：<b>{gap_text}</b>\n"
+                f"當前資金費率：{fmt_pct(self.row_get(r, 'current_funding_rate'))}\n"
+                f"7日平均資金費率：{fmt_pct(self.row_get(r, 'avg_funding_rate_7d'))}\n"
+                f"回本天數：{self.fmt_days(self.row_get(r, 'payback_days'))}\n"
+                f"現貨合約價差：{fmt_pct(self.row_get(r, 'basis_rate'))}\n"
+                f"總滑點：{fmt_pct(self.row_get(r, 'total_slippage'))}\n"
+                f"半自動：<code>/order {self.h(symbol)} {DEFAULT_ORDER_NOTIONAL_USDT}</code>\n"
+                f"原因查詢：<code>/why {self.h(symbol)}</code>"
+            )
+
+        await self.send("\n".join(lines))
+
+    # =========================
+    # /why SYMBOL 診斷
+    # =========================
+
+    async def cmd_why(self, symbol: str):
+        with self.db.conn() as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute("""
+            SELECT *
+            FROM scan_results
+            WHERE symbol=?
+            ORDER BY ts DESC, id DESC
+            LIMIT 1
+            """, (symbol,)).fetchone()
+
+        if not row:
+            await self.send(
+                f"🔎 <b>{self.h(symbol)} 訊號診斷</b>\n\n"
+                "查無這個交易對的掃描資料。\n\n"
+                "可能原因：\n"
+                "1. 這個交易對尚未被掃描到\n"
+                "2. 當前資金費率低於初步門檻，所以沒有寫入資料庫\n"
+                "3. 現貨或合約市場不符合系統條件\n"
+                "4. 剛部署完成，資料還沒累積\n\n"
+                "如果你想讓 BTCUSDT / ETHUSDT 即使 funding 很低也被記錄，"
+                "下一步可以加入 ALWAYS_TRACK_SYMBOLS 白名單功能。"
+            )
+            return
+
+        status = str(self.row_get(row, "status", "")).upper()
+        apy = self.row_get(row, "apy")
+        avg_rate = self.row_get(row, "avg_funding_rate_7d")
+        current_rate = self.row_get(row, "current_funding_rate")
+        fail_reason = self.row_get(row, "fail_reason", "")
+
+        explanation = []
+
+        if status == "PASS":
+            explanation.append("此交易對目前通過你的篩選條件。")
+        elif status == "WATCH":
+            explanation.append("此交易對目前列為觀察，通常代表當前資金費率偏高，但歷史穩定性或其他條件尚未完全通過。")
+        elif status == "FAIL":
+            explanation.append("此交易對目前未通過篩選條件。")
+        else:
+            explanation.append("此交易對目前狀態不明，請檢查資料庫欄位。")
+
+        if apy is None:
+            explanation.append("年化收益率沒有計算出來，通常代表它在計算 APY 之前就已被某個條件擋下。")
+
+        if avg_rate is None:
+            explanation.append("7日平均資金費率為空，可能是歷史 funding 資料不足，或尚未進入穩定性計算階段。")
+
+        if fail_reason:
+            explanation.append(f"未通過原因：{fail_reason}")
+
+        if not explanation:
+            explanation.append("目前沒有額外診斷資訊。")
+
+        msg = (
+            f"🔎 <b>{self.h(symbol)} 訊號診斷</b>\n\n"
+            f"最新狀態：<b>{self.status_text(status)}</b>\n"
+            f"時間：<code>{self.fmt_time(self.row_get(row, 'ts'))}</code>\n\n"
+
+            f"當前資金費率：{fmt_pct(current_rate)}\n"
+            f"7日平均資金費率：{fmt_pct(avg_rate)}\n"
+            f"年化收益率：<b>{fmt_pct(apy, 2)}</b>\n"
+            f"目標年化：<b>{TARGET_APY * 100:.2f}%</b>\n"
+            f"目標狀態：<b>{self.target_text(apy)}</b>\n\n"
+
+            f"回本天數：{self.fmt_days(self.row_get(row, 'payback_days'))}\n"
+            f"現貨合約價差：{fmt_pct(self.row_get(row, 'basis_rate'))}\n"
+            f"現貨滑點：{fmt_pct(self.row_get(row, 'spot_slippage'))}\n"
+            f"合約滑點：{fmt_pct(self.row_get(row, 'futures_slippage'))}\n"
+            f"總滑點：{fmt_pct(self.row_get(row, 'total_slippage'))}\n"
+            f"標記價格：<code>{self.fmt_price(self.row_get(row, 'mark_price'))}</code>\n"
+            f"24H 成交額：<code>{self.fmt_money(self.row_get(row, 'quote_volume'))}</code>\n"
+            f"合約未平倉名目價值：<code>{self.fmt_money(self.row_get(row, 'open_interest_notional'))}</code>\n\n"
+
+            "📌 <b>診斷說明</b>\n"
+            + "\n".join([f"- {self.h(x)}" for x in explanation])
+        )
+
+        await self.send(msg)
+
+    # =========================
+    # 半自動下單
+    # =========================
+
     async def cmd_order(self, symbol: str, notional: float):
         if notional <= 0 or notional > MAX_ORDER_NOTIONAL_USDT:
-            await self.send(f"❌ 金額不合法，上限 {MAX_ORDER_NOTIONAL_USDT} USDT")
+            await self.send(
+                f"❌ <b>金額不合法</b>\n\n"
+                f"下單金額：<code>{notional}</code> USDT\n"
+                f"系統上限：<code>{MAX_ORDER_NOTIONAL_USDT}</code> USDT"
+            )
             return
 
         intent = self.db.create_intent(symbol, notional, "telegram manual order")
 
         await self.send(
             "📝 <b>已建立半自動下單意圖</b>\n\n"
-            f"Symbol：<b>{intent['symbol']}</b>\n"
-            f"方向：<code>買現貨 + 空合約</code>\n"
-            f"金額：<code>{notional:.2f} USDT</code>\n"
-            f"ENABLE_TRADING：<code>{ENABLE_TRADING}</code>\n"
-            f"DRY_RUN：<code>{DRY_RUN}</code>\n\n"
-            f"確認碼：<code>{intent['confirm_code']}</code>\n\n"
-            f"確認：<code>/confirm {intent['confirm_code']}</code>\n"
-            f"取消：<code>/cancel {intent['confirm_code']}</code>"
+            f"交易對：<b>{self.h(intent['symbol'])}</b>\n"
+            f"策略方向：<code>買現貨 + 空合約</code>\n"
+            f"名目金額：<code>{notional:.2f} USDT</code>\n"
+            f"是否允許實盤交易：<code>{ENABLE_TRADING}</code>\n"
+            f"是否模擬交易 DRY_RUN：<code>{DRY_RUN}</code>\n\n"
+            f"確認碼：<code>{self.h(intent['confirm_code'])}</code>\n\n"
+            f"確認執行：<code>/confirm {self.h(intent['confirm_code'])}</code>\n"
+            f"取消意圖：<code>/cancel {self.h(intent['confirm_code'])}</code>\n\n"
+            "⚠️ 請確認 API 權限、倉位風險、現貨與合約數量是否能對沖。"
         )
 
     async def cmd_confirm(self, code: str):
         intent = self.db.get_pending_intent(code)
         if not intent:
-            await self.send("❌ 找不到待確認下單意圖")
+            await self.send("❌ 找不到待確認下單意圖。")
             return
 
         result = await self.trader.execute_hedge_entry(intent)
@@ -940,21 +1278,25 @@ class Telegram:
         self.db.update_intent(intent["id"], status, result)
 
         await self.send(
-            "✅ <b>下單意圖處理完成</b>\n"
-            f"Symbol：<b>{intent['symbol']}</b>\n"
-            f"Status：<code>{status}</code>\n"
-            f"Mode：<code>{result.get('mode')}</code>\n"
-            f"Message：<code>{result.get('message', '')}</code>"
+            "✅ <b>下單意圖處理完成</b>\n\n"
+            f"交易對：<b>{self.h(intent['symbol'])}</b>\n"
+            f"狀態：<code>{self.h(status)}</code>\n"
+            f"模式：<code>{self.h(result.get('mode'))}</code>\n"
+            f"訊息：<code>{self.h(result.get('message', ''))}</code>"
         )
 
     async def cmd_cancel(self, code: str):
         intent = self.db.get_pending_intent(code)
         if not intent:
-            await self.send("找不到待取消意圖")
+            await self.send("❌ 找不到待取消下單意圖。")
             return
-        self.db.update_intent(intent["id"], "CANCELLED", {"cancelled_by": "telegram"})
-        await self.send(f"✅ 已取消：<code>{code}</code>")
 
+        self.db.update_intent(intent["id"], "CANCELLED", {"cancelled_by": "telegram"})
+
+        await self.send(
+            "✅ <b>已取消下單意圖</b>\n\n"
+            f"確認碼：<code>{self.h(code)}</code>"
+        )
 
 # =========================
 # Scanner
