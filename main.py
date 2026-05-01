@@ -69,6 +69,12 @@ POSITIVE_RATIO_THRESHOLD = max(
 )
 
 HISTORICAL_FUNDING_LIMIT = int(os.getenv("HISTORICAL_FUNDING_LIMIT", "21"))
+ALWAYS_TRACK_SYMBOLS = {
+    norm_symbol(x)
+    for x in os.getenv("ALWAYS_TRACK_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT").split(",")
+    if x.strip()
+}
+
 
 HIGH_RISK_CURRENT_RATE_THRESHOLD = float(os.getenv("HIGH_RISK_CURRENT_RATE_THRESHOLD", "0.0005"))
 ENABLE_HIGH_RISK_WATCHLIST = os.getenv("ENABLE_HIGH_RISK_WATCHLIST", "true").lower() == "true"
@@ -751,6 +757,18 @@ def estimate_sell_slippage(book: Dict[str, Any], notional: float) -> Optional[fl
 
 
 def analyze_history(history: List[Dict[str, Any]], current_rate: float) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    回傳：
+    1. stats：只要歷史資料足夠，就會回傳 funding 統計資料
+    2. fail_reason：若穩定性不通過，回傳原因；若通過，回傳空字串
+
+    這樣即使 FAIL，/why 也可以顯示：
+    - 7日平均資金費率
+    - 正費率比例
+    - Funding 標準差
+    - 近期平均資金費率
+    - 毛年化與真實淨年化
+    """
     if len(history) < HISTORICAL_FUNDING_LIMIT:
         return None, "歷史資料不足"
 
@@ -773,34 +791,37 @@ def analyze_history(history: List[Dict[str, Any]], current_rate: float) -> Tuple
     max_abs = float(df["fundingRate"].abs().max())
     recent_avg = float(df["fundingRate"].tail(RECENT_FUNDING_CHECK_PERIODS).mean())
 
-    if pos_ratio < POSITIVE_RATIO_THRESHOLD:
-        return None, f"正費率比例不足：{pos_ratio:.2f}"
-
-    if avg < AVG_FUNDING_RATE_THRESHOLD:
-        return None, f"7日平均不足：{fmt_pct(avg)}"
-
-    if std > MAX_FUNDING_STD_7D:
-        return None, f"標準差過高：{fmt_pct(std)}"
-
-    if avg > 0 and (std / avg) > MAX_STD_TO_AVG_RATIO:
-        return None, f"標準差相對平均過高：{std / avg:.2f}"
-
-    if max_abs > MAX_ABS_HISTORICAL_FUNDING_RATE:
-        return None, f"歷史異常值過高：{fmt_pct(max_abs)}"
-
-    if recent_avg < avg * RECENT_AVG_MIN_RATIO_TO_7D:
-        return None, "近期費率衰退"
-
-    if current_rate < avg * CURRENT_MIN_RATIO_TO_7D:
-        return None, "當前費率低於7日平均過多"
-
-    return {
+    stats = {
         "avg_funding_rate_7d": avg,
         "std_funding_rate_7d": std,
         "positive_ratio_7d": pos_ratio,
         "recent_avg_funding_rate": recent_avg,
-    }, ""
+    }
 
+    fail_reasons = []
+
+    if pos_ratio < POSITIVE_RATIO_THRESHOLD:
+        fail_reasons.append(f"正費率比例不足：{pos_ratio:.2f}")
+
+    if avg < AVG_FUNDING_RATE_THRESHOLD:
+        fail_reasons.append(f"7日平均不足：{fmt_pct(avg)}")
+
+    if std > MAX_FUNDING_STD_7D:
+        fail_reasons.append(f"標準差過高：{fmt_pct(std)}")
+
+    if avg > 0 and (std / avg) > MAX_STD_TO_AVG_RATIO:
+        fail_reasons.append(f"標準差相對平均過高：{std / avg:.2f}")
+
+    if max_abs > MAX_ABS_HISTORICAL_FUNDING_RATE:
+        fail_reasons.append(f"歷史異常值過高：{fmt_pct(max_abs)}")
+
+    if recent_avg < avg * RECENT_AVG_MIN_RATIO_TO_7D:
+        fail_reasons.append("近期費率衰退")
+
+    if current_rate < avg * CURRENT_MIN_RATIO_TO_7D:
+        fail_reasons.append("當前費率低於7日平均過多")
+
+    return stats, "；".join(fail_reasons)
 
 def calc_daily_funding_yield(avg_funding_rate: float) -> float:
     return safe_float(avg_funding_rate, 0.0) * 3
@@ -1509,7 +1530,7 @@ class Scanner:
 
             await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
-    async def run_once(self):
+        async def run_once(self):
         logger.info("開始新一輪掃描")
 
         blacklist = self.db.blacklist()
@@ -1541,6 +1562,8 @@ class Scanner:
             if not ticker:
                 continue
 
+            force_track = symbol in ALWAYS_TRACK_SYMBOLS
+
             try:
                 mark_price = float(p.get("markPrice", 0))
                 current_rate = float(p.get("lastFundingRate", 0))
@@ -1551,11 +1574,14 @@ class Scanner:
             if mark_price <= 0:
                 continue
 
-            # 正向套利只接受正 funding，且要高於門檻
-            if current_rate <= CURRENT_FUNDING_RATE_THRESHOLD:
+            # 一般標的：必須通過初步 funding 門檻
+            # ALWAYS_TRACK_SYMBOLS：即使 funding 低，也要記錄最新診斷
+            if not force_track and current_rate <= CURRENT_FUNDING_RATE_THRESHOLD:
                 continue
 
-            if quote_vol < MIN_24H_QUOTE_VOLUME_USDT:
+            # 一般標的：必須通過成交量門檻
+            # ALWAYS_TRACK_SYMBOLS：即使成交量不足，也要記錄原因
+            if not force_track and quote_vol < MIN_24H_QUOTE_VOLUME_USDT:
                 continue
 
             candidates.append({
@@ -1563,9 +1589,13 @@ class Scanner:
                 "mark_price": mark_price,
                 "current_funding_rate": current_rate,
                 "quote_volume": quote_vol,
+                "force_track": force_track,
             })
 
-        logger.info(f"初步候選數量：{len(candidates)}")
+        logger.info(
+            f"初步候選數量：{len(candidates)} | "
+            f"固定追蹤：{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}"
+        )
 
         results = await asyncio.gather(
             *[self.analyze(c) for c in candidates],
@@ -1605,8 +1635,9 @@ class Scanner:
         await self.alert(passed[:10], watched[:5])
         logger.info(f"掃描完成 PASS={len(passed)} WATCH={len(watched)}")
 
-    async def analyze(self, c: Dict[str, Any]) -> Dict[str, Any]:
+        async def analyze(self, c: Dict[str, Any]) -> Dict[str, Any]:
         symbol = c["symbol"]
+        force_track = bool(c.get("force_track", False))
 
         row = {
             "ts": now_ts(),
@@ -1617,22 +1648,19 @@ class Scanner:
             "mark_price": c["mark_price"],
         }
 
+        fail_reasons = []
+
         try:
             current_rate = c["current_funding_rate"]
 
             if current_rate <= 0:
-                row.update({
-                    "status": "FAIL",
-                    "fail_reason": f"非正資金費率，不適合正向套利：{current_rate:.6f}",
-                })
-                return row
+                fail_reasons.append(f"非正資金費率，不適合正向套利：{current_rate:.6f}")
 
             if current_rate < CURRENT_FUNDING_RATE_THRESHOLD:
-                row.update({
-                    "status": "FAIL",
-                    "fail_reason": f"當前資金費率不足：{current_rate:.6f}",
-                })
-                return row
+                fail_reasons.append(f"當前資金費率不足：{current_rate:.6f}")
+
+            if c["quote_volume"] < MIN_24H_QUOTE_VOLUME_USDT:
+                fail_reasons.append(f"24H 成交額不足：{c['quote_volume']:.0f}")
 
             oi, spot_book, fut_book, hist = await asyncio.gather(
                 self.api.open_interest(symbol),
@@ -1645,11 +1673,7 @@ class Scanner:
             row["open_interest_notional"] = oi_notional
 
             if oi_notional < MIN_OPEN_INTEREST_NOTIONAL_USDT:
-                row.update({
-                    "status": "FAIL",
-                    "fail_reason": f"OI 名目價值不足：{oi_notional:.0f}",
-                })
-                return row
+                fail_reasons.append(f"合約未平倉名目價值不足：{oi_notional:.0f}")
 
             spot_mid = orderbook_mid(spot_book)
             fut_mid = orderbook_mid(fut_book)
@@ -1665,13 +1689,12 @@ class Scanner:
             row["basis_rate"] = basis
 
             if abs(basis) > MAX_ABS_BASIS_RATE:
-                row.update({
-                    "status": "FAIL",
-                    "fail_reason": f"Basis 過大：{fmt_pct(basis)}",
-                })
-                return row
+                fail_reasons.append(f"Basis 過大：{fmt_pct(basis)}")
 
             if USE_DYNAMIC_SLIPPAGE_COST:
+                # 正向套利進場：
+                # 現貨買入吃 asks
+                # 合約開空等同賣出吃 bids
                 spot_slip = estimate_buy_slippage(
                     spot_book,
                     SLIPPAGE_TEST_NOTIONAL_USDT,
@@ -1701,34 +1724,22 @@ class Scanner:
             })
 
             if total_slip > MAX_TOTAL_SLIPPAGE_RATE:
-                row.update({
-                    "status": "FAIL",
-                    "fail_reason": f"滑點過高：{fmt_pct(total_slip)}",
-                })
-                return row
+                fail_reasons.append(f"滑點過高：{fmt_pct(total_slip)}")
 
-            stability, fail_reason = analyze_history(
+            stability, stability_fail_reason = analyze_history(
                 hist,
                 current_rate,
             )
 
             if stability is None:
-                if (
-                    ENABLE_HIGH_RISK_WATCHLIST
-                    and current_rate >= HIGH_RISK_CURRENT_RATE_THRESHOLD
-                ):
-                    row.update({
-                        "status": "WATCH",
-                        "signal_level": "⚠️ 高風險觀察",
-                        "fail_reason": fail_reason,
-                    })
-                    return row
-
                 row.update({
                     "status": "FAIL",
-                    "fail_reason": fail_reason,
+                    "fail_reason": stability_fail_reason,
                 })
                 return row
+
+            if stability_fail_reason:
+                fail_reasons.append(stability_fail_reason)
 
             metrics = calc_forward_net_metrics(
                 stability["avg_funding_rate_7d"],
@@ -1744,6 +1755,80 @@ class Scanner:
             positive_ratio = stability.get("positive_ratio_7d")
             net_apy = metrics.get("net_apy")
             payback_days = metrics.get("payback_days")
+
+            # =========================
+            # 額外硬性過濾
+            # =========================
+
+            if avg_rate < AVG_FUNDING_RATE_THRESHOLD:
+                fail_reasons.append(f"7日平均資金費率不足：{avg_rate:.6f}")
+
+            if positive_ratio is not None and positive_ratio < POSITIVE_RATIO_THRESHOLD:
+                fail_reasons.append(f"正費率比例不足：{positive_ratio:.2f}")
+
+            if std_rate is not None and std_rate > MAX_FUNDING_STD_7D:
+                fail_reasons.append(f"資金費率波動過大：{std_rate:.6f}")
+
+            if (
+                avg_rate > 0
+                and std_rate is not None
+                and (std_rate / avg_rate) > MAX_STD_TO_AVG_RATIO
+            ):
+                fail_reasons.append(f"資金費率波動相對平均過大：{std_rate / avg_rate:.2f}")
+
+            if payback_days is None or payback_days > MAX_PAYBACK_DAYS:
+                fail_reasons.append(f"回本天數過長：{safe_float(payback_days, 999999):.2f} 天")
+
+            if net_apy is None or net_apy < TARGET_NET_APY:
+                fail_reasons.append(
+                    f"扣除成本後真實淨年化不足：{safe_float(net_apy, 0.0) * 100:.2f}%"
+                )
+
+            # 去重，避免同一個原因重複出現
+            clean_fail_reasons = []
+            seen = set()
+
+            for reason in fail_reasons:
+                if not reason:
+                    continue
+                if reason in seen:
+                    continue
+                seen.add(reason)
+                clean_fail_reasons.append(reason)
+
+            if clean_fail_reasons:
+                # 高 funding 但未完全通過，可列 WATCH
+                if (
+                    ENABLE_HIGH_RISK_WATCHLIST
+                    and current_rate >= HIGH_RISK_CURRENT_RATE_THRESHOLD
+                    and not force_track
+                ):
+                    row.update({
+                        "status": "WATCH",
+                        "signal_level": "⚠️ 高風險觀察",
+                        "fail_reason": "；".join(clean_fail_reasons),
+                    })
+                    return row
+
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": "；".join(clean_fail_reasons),
+                })
+                return row
+
+            row.update({
+                "status": "PASS",
+                "signal_level": classify(payback_days, net_apy),
+            })
+
+            return row
+
+        except Exception as e:
+            row.update({
+                "status": "FAIL",
+                "fail_reason": str(e),
+            })
+            return row
 
             # =========================
             # 正向套利真實淨利版硬性過濾
