@@ -1691,7 +1691,211 @@ class Scanner:
 
                 row.update({"status": "FAIL", "fail_reason": fail_reason})
                 return row
+              metrics = calc_forward_net_metrics(
+                  stability["avg_funding_rate_7d"],
+                  spot_slip,
+                  fut_slip,
+              )
 
-            metrics = calc_forward_net_metrics(
-                stability["avg_funding_rate_7d"],
-                spot_sl
+              row.update(stability)
+              row.update(metrics)
+
+              avg_rate = stability["avg_funding_rate_7d"]
+              std_rate = stability.get("std_funding_rate_7d")
+              positive_ratio = stability.get("positive_ratio_7d")
+              net_apy = metrics.get("net_apy")
+              payback_days = metrics.get("payback_days")
+
+              # =========================
+              # 正向套利真實淨利版硬性過濾
+              # =========================
+
+              if current_rate <= 0:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"非正資金費率，不適合正向套利：{current_rate:.6f}",
+                  })
+                  return row
+
+              if current_rate < CURRENT_FUNDING_RATE_THRESHOLD:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"當前資金費率不足：{current_rate:.6f}",
+                  })
+                  return row
+
+              if avg_rate < AVG_FUNDING_RATE_THRESHOLD:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"7日平均資金費率不足：{avg_rate:.6f}",
+                  })
+                  return row
+
+              if positive_ratio is not None and positive_ratio < POSITIVE_RATIO_THRESHOLD:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"正費率比例不足：{positive_ratio:.2f}",
+                  })
+                  return row
+
+              if std_rate is not None and std_rate > MAX_FUNDING_STD_7D:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"資金費率波動過大：{std_rate:.6f}",
+                  })
+                  return row
+
+              if avg_rate > 0 and std_rate is not None and (std_rate / avg_rate) > MAX_STD_TO_AVG_RATIO:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"資金費率波動相對平均過大：{std_rate / avg_rate:.2f}",
+                  })
+                  return row
+
+              if total_slip > MAX_TOTAL_SLIPPAGE_RATE:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"總滑點過高：{fmt_pct(total_slip)}",
+                  })
+                  return row
+
+              if payback_days is None or payback_days > MAX_PAYBACK_DAYS:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"回本天數過長：{safe_float(payback_days, 999999):.2f} 天",
+                  })
+                  return row
+
+              if net_apy is None or net_apy < TARGET_NET_APY:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"扣除成本後真實淨年化不足：{safe_float(net_apy, 0.0) * 100:.2f}%",
+                  })
+                  return row
+
+              if c["quote_volume"] < MIN_24H_QUOTE_VOLUME_USDT:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"24H 成交額不足：{c['quote_volume']:.0f}",
+                  })
+                  return row
+
+              if oi_notional < MIN_OPEN_INTEREST_NOTIONAL_USDT:
+                  row.update({
+                      "status": "FAIL",
+                      "fail_reason": f"合約未平倉名目價值不足：{oi_notional:.0f}",
+                  })
+                  return row
+
+              row.update({
+                  "status": "PASS",
+                  "signal_level": classify(payback_days, net_apy),
+              })
+              return row
+
+          except Exception as e:
+              row.update({
+                  "status": "FAIL",
+                  "fail_reason": str(e),
+              })
+              return row
+
+      async def alert(self, passed: List[Dict[str, Any]], watched: List[Dict[str, Any]]):
+          send_pass = []
+          send_watch = []
+
+          for t in passed:
+              key = f"PASS:{t['symbol']}"
+              if self.db.should_alert(key):
+                  self.db.mark_alert(key)
+                  send_pass.append(t)
+
+          for t in watched:
+              key = f"WATCH:{t['symbol']}"
+              if self.db.should_alert(key):
+                  self.db.mark_alert(key)
+                  send_watch.append(t)
+
+          if not send_pass and not send_watch:
+              return
+
+          lines = [
+              "🚨 <b>Funding Radar V2｜正向套利真實淨利版</b>",
+              f"時間：<code>{utc_text()}</code>",
+              f"PASS：<b>{len(send_pass)}</b>",
+              f"WATCH：<b>{len(send_watch)}</b>",
+              "",
+          ]
+
+          if send_pass:
+              lines.append("✅ <b>真實淨利通過標的</b>")
+
+              for i, t in enumerate(send_pass, 1):
+                  lines.extend([
+                      "",
+                      f"#{i} <b>{t['symbol']}</b>｜{t.get('signal_level')}",
+                      f"方向：<b>買現貨 + 空合約</b>",
+                      f"當前費率：<b>{fmt_pct(t.get('current_funding_rate'))}</b>",
+                      f"7日平均：<b>{fmt_pct(t.get('avg_funding_rate_7d'))}</b>",
+                      f"毛年化：<b>{fmt_pct(t.get('gross_apy') or t.get('apy'), 2)}</b>",
+                      f"真實淨年化：<b>{fmt_pct(t.get('net_apy'), 2)}</b>",
+                      f"回本：<b>{safe_float(t.get('payback_days'), 999999):.2f} 天</b>",
+                      f"完整成本：<b>{fmt_pct(t.get('roundtrip_cost_rate'), 4)}</b>",
+                      f"每日 funding：<b>{fmt_pct(t.get('daily_funding_yield'), 4)}</b>",
+                      f"每日成本攤提：<b>{fmt_pct(t.get('daily_cost_drag'), 4)}</b>",
+                      f"Basis：<b>{fmt_pct(t.get('basis_rate'))}</b>",
+                      f"總滑點：<b>{fmt_pct(t.get('total_slippage'))}</b>",
+                      f"半自動：<code>/order {t['symbol']} {DEFAULT_ORDER_NOTIONAL_USDT}</code>",
+                      f"診斷：<code>/why {t['symbol']}</code>",
+                  ])
+
+          if send_watch:
+              lines.extend(["", "⚠️ <b>高風險觀察</b>"])
+
+              for i, t in enumerate(send_watch, 1):
+                  lines.extend([
+                      "",
+                      f"#{i} <b>{t['symbol']}</b>",
+                      f"當前費率：<b>{fmt_pct(t.get('current_funding_rate'))}</b>",
+                      f"原因：<code>{html.escape(str(t.get('fail_reason', '')))}</code>",
+                      f"診斷：<code>/why {t['symbol']}</code>",
+                  ])
+
+          lines.extend([
+              "",
+              f"🎯 目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>",
+              "⚠️ 僅供監控，不代表投資建議。實盤請先 DRY_RUN。",
+          ])
+
+          await self.tg.send("\n".join(lines))
+
+
+  # =========================
+  # Main
+  # =========================
+  async def main():
+      logger.info("Funding Radar V2 Net Profit starting")
+
+      db = RadarDB(DB_PATH)
+
+      timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+      sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
+
+      async with aiohttp.ClientSession(timeout=timeout) as session:
+          http = Http(session, sem)
+          api = BinancePublic(http)
+          trader = Trader(http, db)
+          tg = Telegram(session, db, trader)
+          scanner = Scanner(db, api, tg)
+
+          await asyncio.gather(
+              scanner.loop(),
+              tg.poll_loop(),
+          )
+
+
+  if __name__ == "__main__":
+      try:
+          asyncio.run(main())
+      except KeyboardInterrupt:
+          logger.info("Stopped")
