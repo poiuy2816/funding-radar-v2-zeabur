@@ -1832,3 +1832,39 @@ class Scanner:
                 ])
 
         lines
+# =========================
+# Main
+# =========================
+async def main():
+    logger.info("Funding Radar V2 Net Profit starting")
+
+    db = RadarDB(DB_PATH)
+
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+    sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        http = Http(session, sem)
+        api = BinancePublic(http)
+        trader = Trader(http, db)
+        tg = Telegram(session, db, trader)
+        scanner = Scanner(db, api, tg)
+
+        await tg.send(
+            "✅ <b>Funding Radar 已啟動</b>\n\n"
+            f"時間：<code>{utc_text()}</code>\n"
+            f"固定追蹤：<code>{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}</code>\n"
+            "你可以輸入：<code>/status</code>"
+        )
+
+        await asyncio.gather(
+            scanner.loop(),
+            tg.poll_loop(),
+        )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Stopped")
