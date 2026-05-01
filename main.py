@@ -70,6 +70,17 @@ ALWAYS_TRACK_SYMBOLS = {
     for x in os.getenv("ALWAYS_TRACK_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT").split(",")
     if x.strip()
 }
+# =========================
+# Ranking Mode
+# =========================
+# 排名模式不要求 16%，而是從最高真實淨年化往下排
+RANK_SCAN_MIN_CURRENT_FUNDING_RATE = float(
+    os.getenv("RANK_SCAN_MIN_CURRENT_FUNDING_RATE", "0")
+)
+
+MAX_RANK_CANDIDATES = int(
+    os.getenv("MAX_RANK_CANDIDATES", "80")
+)
 
 HIGH_RISK_CURRENT_RATE_THRESHOLD = float(os.getenv("HIGH_RISK_CURRENT_RATE_THRESHOLD", "0.0005"))
 ENABLE_HIGH_RISK_WATCHLIST = os.getenv("ENABLE_HIGH_RISK_WATCHLIST", "true").lower() == "true"
@@ -1041,6 +1052,70 @@ class Telegram:
             return f"淨年化尚未達標，還差 {abs(gap) * 100:.2f}%"
         except Exception:
             return "無法判斷"
+    def calc_stability_score_from_row(self, row: sqlite3.Row) -> Tuple[int, str]:
+        """
+        穩定度分數 0~100：
+        - 正費率比例越高越好
+        - 標準差 / 平均越低越好
+        - 近期 funding 沒有明顯衰退越好
+        - 當前 funding 沒有低於 7 日平均太多越好
+        - 回本天數越短越好
+        """
+        avg_rate = safe_float(self.row_get(row, "avg_funding_rate_7d"), 0.0)
+        std_rate = safe_float(self.row_get(row, "std_funding_rate_7d"), 0.0)
+        pos_ratio = self.row_get(row, "positive_ratio_7d")
+        recent_avg = self.row_get(row, "recent_avg_funding_rate")
+        current_rate = self.row_get(row, "current_funding_rate")
+        payback_days = self.row_get(row, "payback_days")
+
+        if pos_ratio is None:
+            return 0, "資料不足"
+
+        pos_ratio = safe_float(pos_ratio, 0.0)
+        recent_avg = safe_float(recent_avg, 0.0)
+        current_rate = safe_float(current_rate, 0.0)
+        payback_days = safe_float(payback_days, 999999.0)
+
+        score = 100.0
+
+        # 正費率比例不足扣分，最多扣 35
+        if pos_ratio < 0.8:
+            score -= min(35.0, (0.8 - pos_ratio) / 0.8 * 35.0)
+
+        # 平均 funding <= 0，代表不適合正向套利
+        if avg_rate <= 0:
+            score -= 30.0
+        else:
+            std_to_avg = std_rate / avg_rate
+
+            # 波動相對平均過大扣分，最多扣 25
+            if std_to_avg > 1.0:
+                score -= min(25.0, (std_to_avg - 1.0) * 12.5)
+
+            # 近期 funding 衰退扣分
+            if recent_avg < avg_rate * RECENT_AVG_MIN_RATIO_TO_7D:
+                score -= 15.0
+
+            # 當前 funding 低於 7 日平均太多扣分
+            if current_rate < avg_rate * CURRENT_MIN_RATIO_TO_7D:
+                score -= 15.0
+
+        # 回本天數太長扣分
+        if payback_days > MAX_PAYBACK_DAYS:
+            score -= min(15.0, (payback_days - MAX_PAYBACK_DAYS) * 1.5)
+
+        score = int(max(0, min(100, round(score))))
+
+        if score >= 80:
+            label = "🟢 穩定"
+        elif score >= 60:
+            label = "🟡 普通"
+        elif score >= 40:
+            label = "🟠 偏不穩"
+        else:
+            label = "🔴 不穩"
+
+        return score, label
 
     async def poll_loop(self):
         if not TELEGRAM_BOT_TOKEN:
@@ -1109,10 +1184,13 @@ class Telegram:
                 await self.send("▶️ <b>已恢復掃描</b>")
 
             elif cmd == "/top":
-                await self.cmd_top()
+                await self.cmd_rank()
+
+            elif cmd == "/rank":
+                await self.cmd_rank()
 
             elif cmd == "/topnet":
-                await self.cmd_top()
+                await self.cmd_rank()
 
             elif cmd == "/top16":
                 await self.cmd_top16()
@@ -1149,6 +1227,111 @@ class Telegram:
                     "<code>/top16</code>\n"
                     "<code>/why ETHUSDT</code>"
                 )
+    async def cmd_rank(self):
+        since_ts = now_ts() - 24 * 60 * 60
+
+        with self.db.conn() as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute("""
+            WITH ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY symbol
+                        ORDER BY ts DESC, id DESC
+                    ) AS rn
+                FROM scan_results
+                WHERE ts >= ?
+            )
+            SELECT *
+            FROM ranked
+            WHERE rn = 1
+              AND net_apy IS NOT NULL
+              AND avg_funding_rate_7d IS NOT NULL
+              AND current_funding_rate IS NOT NULL
+              AND current_funding_rate > 0
+            ORDER BY
+                COALESCE(net_apy, -999999) DESC,
+                COALESCE(payback_days, 999999) ASC
+            LIMIT ?
+            """, (since_ts, TOP_RANK_LIMIT * 3)).fetchall()
+
+        if not rows:
+            await self.send(
+                "目前沒有可排名的資料。\n\n"
+                "可能原因：\n"
+                "1. 剛部署，尚未完成一輪掃描\n"
+                "2. 目前正 funding 標的太少\n"
+                "3. 歷史 funding 資料不足\n\n"
+                "可先查：<code>/why ETHUSDT</code>"
+            )
+            return
+
+        # Python 端加入穩定度分數後再排序
+        enriched = []
+
+        for r in rows:
+            score, label = self.calc_stability_score_from_row(r)
+            enriched.append((r, score, label))
+
+        enriched.sort(
+            key=lambda x: (
+                safe_float(self.row_get(x[0], "net_apy"), -999999.0),
+                x[1],
+                -safe_float(self.row_get(x[0], "payback_days"), 999999.0),
+            ),
+            reverse=True,
+        )
+
+        enriched = enriched[:TOP_RANK_LIMIT]
+
+        lines = [
+            "🏆 <b>Funding 排名模式</b>",
+            "<code>不要求 16%，依真實淨年化由高到低排序</code>",
+            f"顯示數量：<b>{len(enriched)}</b>",
+            f"固定追蹤：<code>{self.h(','.join(sorted(ALWAYS_TRACK_SYMBOLS)))}</code>",
+            "",
+            "📌 判斷重點：",
+            "1. 真實淨年化越高越好",
+            "2. 穩定度越高越好",
+            "3. 回本天數越短越好",
+            "4. 正費率比例越高越好",
+        ]
+
+        for i, item in enumerate(enriched, 1):
+            r, score, label = item
+            symbol = self.row_get(r, "symbol", "")
+            status = str(self.row_get(r, "status", "")).upper()
+            fail_reason = self.row_get(r, "fail_reason", "")
+
+            reason_text = ""
+            if status != "PASS" and fail_reason:
+                reason_text = f"\n未通過原因：<code>{self.h(str(fail_reason)[:160])}</code>"
+
+            lines.append(
+                f"\n#{i} <b>{self.h(symbol)}</b>｜{label} {score}/100\n"
+                f"狀態：<b>{self.status_text(status)}</b>\n"
+                f"時間：<code>{self.fmt_time(self.row_get(r, 'ts'))}</code>\n"
+                f"當前資金費率：{fmt_pct(self.row_get(r, 'current_funding_rate'))}\n"
+                f"7日平均資金費率：{fmt_pct(self.row_get(r, 'avg_funding_rate_7d'))}\n"
+                f"正費率比例：<b>{fmt_pct(self.row_get(r, 'positive_ratio_7d'), 2)}</b>\n"
+                f"Funding 標準差：{fmt_pct(self.row_get(r, 'std_funding_rate_7d'))}\n"
+                f"毛年化：<b>{fmt_pct(self.row_get(r, 'gross_apy') or self.row_get(r, 'apy'), 2)}</b>\n"
+                f"真實淨年化：<b>{fmt_pct(self.row_get(r, 'net_apy'), 2)}</b>\n"
+                f"回本天數：{self.fmt_days(self.row_get(r, 'payback_days'))}\n"
+                f"完整進出場成本：{fmt_pct(self.row_get(r, 'roundtrip_cost_rate'), 4)}\n"
+                f"每日 funding：{fmt_pct(self.row_get(r, 'daily_funding_yield'), 4)}\n"
+                f"每日成本攤提：{fmt_pct(self.row_get(r, 'daily_cost_drag'), 4)}\n"
+                f"總滑點：{fmt_pct(self.row_get(r, 'total_slippage'))}"
+                f"{reason_text}\n"
+                f"診斷：<code>/why {self.h(symbol)}</code>"
+            )
+
+        lines.append(
+            "\n⚠️ 排名不代表可直接進場，請優先看穩定度、回本天數與正費率比例。"
+        )
+
+        await self.send("\n".join(lines))
 
         except Exception as e:
             logger.exception(f"Telegram command error: {e}")
@@ -1159,7 +1342,7 @@ class Telegram:
             "🤖 <b>Funding Radar 指令說明</b>\n\n"
             "📊 <b>查詢</b>\n"
             "/status - 查看系統狀態\n"
-            "/top - 查看真實淨利通過訊號\n"
+            "/top - 排名模式，依真實淨年化由高到低\n"
             "/topnet - 同 /top\n"
             "/top16 - 查看毛年化達標標的\n"
             "/why SYMBOL - 查看單一交易對診斷\n\n"
@@ -1522,10 +1705,14 @@ class Scanner:
 
             if mark_price <= 0:
                 continue
-
-            if not force_track and current_rate <= CURRENT_FUNDING_RATE_THRESHOLD:
+# 排名模式：
+# 不再要求 current funding 一定要大於 0.02%
+# 只要是正 funding，就先納入排名候選
+# ALWAYS_TRACK_SYMBOLS 永遠追蹤
+            if not force_track and current_rate <= RANK_SCAN_MIN_CURRENT_FUNDING_RATE:
                 continue
-
+# 一般標的仍要求成交量，避免掃到太冷門標的
+# 固定追蹤標的不受這個限制
             if not force_track and quote_vol < MIN_24H_QUOTE_VOLUME_USDT:
                 continue
 
@@ -1541,12 +1728,31 @@ class Scanner:
             f"初步候選數量：{len(candidates)} | "
             f"固定追蹤：{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}"
         )
+# 避免一次掃太多幣造成 API 壓力：
+# 1. 固定追蹤標的一定保留
+# 2. 其他標的依 current funding 由高到低取前 MAX_RANK_CANDIDATES
+        force_candidates = [
+            x for x in candidates
+            if x.get("force_track")
+        ]
+        normal_candidates = [
+            x for x in candidates
+            if not x.get("force_track")
+        ]
 
+        normal_candidates.sort(
+            key=lambda x: x.get("current_funding_rate") or 0,
+            reverse=True,
+        )
+        candidates = force_candidates + normal_candidates[:MAX_RANK_CANDIDATES]
+        logger.info(
+            f"實際分析數量：{len(candidates)} | "
+            f"一般候選上限：{MAX_RANK_CANDIDATES}"
+        )
         results = await asyncio.gather(
             *[self.analyze(c) for c in candidates],
             return_exceptions=True,
         )
-
         passed = []
         watched = []
 
