@@ -3,7 +3,6 @@ import json
 import time
 import hmac
 import html
-import math
 import hashlib
 import sqlite3
 import asyncio
@@ -40,9 +39,35 @@ ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "14400"))
 REQUEST_CONCURRENCY = int(os.getenv("REQUEST_CONCURRENCY", "8"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "20"))
 
-CURRENT_FUNDING_RATE_THRESHOLD = float(os.getenv("CURRENT_FUNDING_RATE_THRESHOLD", "0.0002"))
-AVG_FUNDING_RATE_THRESHOLD = float(os.getenv("AVG_FUNDING_RATE_THRESHOLD", "0.00015"))
-POSITIVE_RATIO_THRESHOLD = float(os.getenv("POSITIVE_RATIO_THRESHOLD", "0.8"))
+# =========================
+# 正向套利真實淨利版核心設定
+# =========================
+TARGET_APY = float(os.getenv("TARGET_APY", "0.16"))
+TARGET_NET_APY = float(os.getenv("TARGET_NET_APY", "0.16"))
+
+EXPECTED_HOLD_DAYS = float(os.getenv("EXPECTED_HOLD_DAYS", "30"))
+INCLUDE_EXIT_COST = os.getenv("INCLUDE_EXIT_COST", "true").lower() == "true"
+
+# 16% 年化對應單期 funding 底線
+# Binance funding 通常一天 3 期
+MIN_REQUIRED_AVG_FUNDING_RATE = TARGET_APY / 365 / 3
+
+CURRENT_FUNDING_RATE_THRESHOLD = max(
+    float(os.getenv("CURRENT_FUNDING_RATE_THRESHOLD", "0.0002")),
+    0.0002,
+)
+
+AVG_FUNDING_RATE_THRESHOLD = max(
+    float(os.getenv("AVG_FUNDING_RATE_THRESHOLD", "0.00015")),
+    MIN_REQUIRED_AVG_FUNDING_RATE,
+    0.00015,
+)
+
+POSITIVE_RATIO_THRESHOLD = max(
+    float(os.getenv("POSITIVE_RATIO_THRESHOLD", "0.8")),
+    0.8,
+)
+
 HISTORICAL_FUNDING_LIMIT = int(os.getenv("HISTORICAL_FUNDING_LIMIT", "21"))
 
 HIGH_RISK_CURRENT_RATE_THRESHOLD = float(os.getenv("HIGH_RISK_CURRENT_RATE_THRESHOLD", "0.0005"))
@@ -50,32 +75,47 @@ ENABLE_HIGH_RISK_WATCHLIST = os.getenv("ENABLE_HIGH_RISK_WATCHLIST", "true").low
 
 MAX_ABS_BASIS_RATE = float(os.getenv("MAX_ABS_BASIS_RATE", "0.0015"))
 
-MAX_FUNDING_STD_7D = float(os.getenv("MAX_FUNDING_STD_7D", "0.0005"))
+MAX_FUNDING_STD_7D = float(os.getenv("MAX_FUNDING_STD_7D", "0.0002"))
+MAX_STD_TO_AVG_RATIO = float(os.getenv("MAX_STD_TO_AVG_RATIO", "2.0"))
 MAX_ABS_HISTORICAL_FUNDING_RATE = float(os.getenv("MAX_ABS_HISTORICAL_FUNDING_RATE", "0.003"))
+
 RECENT_FUNDING_CHECK_PERIODS = int(os.getenv("RECENT_FUNDING_CHECK_PERIODS", "3"))
 RECENT_AVG_MIN_RATIO_TO_7D = float(os.getenv("RECENT_AVG_MIN_RATIO_TO_7D", "0.7"))
 CURRENT_MIN_RATIO_TO_7D = float(os.getenv("CURRENT_MIN_RATIO_TO_7D", "0.6"))
 
 SPOT_TAKER_FEE_RATE = float(os.getenv("SPOT_TAKER_FEE_RATE", "0.001"))
 FUTURES_TAKER_FEE_RATE = float(os.getenv("FUTURES_TAKER_FEE_RATE", "0.001"))
+
 USE_DYNAMIC_SLIPPAGE_COST = os.getenv("USE_DYNAMIC_SLIPPAGE_COST", "true").lower() == "true"
 SLIPPAGE_TEST_NOTIONAL_USDT = float(os.getenv("SLIPPAGE_TEST_NOTIONAL_USDT", "10000"))
 MAX_TOTAL_SLIPPAGE_RATE = float(os.getenv("MAX_TOTAL_SLIPPAGE_RATE", "0.001"))
 ORDER_BOOK_LIMIT = int(os.getenv("ORDER_BOOK_LIMIT", "100"))
 
-MAX_PAYBACK_DAYS = float(os.getenv("MAX_PAYBACK_DAYS", "4"))
-STRONG_SIGNAL_PAYBACK_DAYS = float(os.getenv("STRONG_SIGNAL_PAYBACK_DAYS", "2"))
+MAX_PAYBACK_DAYS = min(
+    float(os.getenv("MAX_PAYBACK_DAYS", "4")),
+    4.0,
+)
 
-MIN_24H_QUOTE_VOLUME_USDT = float(os.getenv("MIN_24H_QUOTE_VOLUME_USDT", "10000000"))
-MIN_OPEN_INTEREST_NOTIONAL_USDT = float(os.getenv("MIN_OPEN_INTEREST_NOTIONAL_USDT", "5000000"))
+STRONG_SIGNAL_PAYBACK_DAYS = min(
+    float(os.getenv("STRONG_SIGNAL_PAYBACK_DAYS", "2")),
+    MAX_PAYBACK_DAYS,
+)
+
+MIN_24H_QUOTE_VOLUME_USDT = max(
+    float(os.getenv("MIN_24H_QUOTE_VOLUME_USDT", "10000000")),
+    5_000_000,
+)
+
+MIN_OPEN_INTEREST_NOTIONAL_USDT = max(
+    float(os.getenv("MIN_OPEN_INTEREST_NOTIONAL_USDT", "5000000")),
+    5_000_000,
+)
 
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "false").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 MAX_ORDER_NOTIONAL_USDT = float(os.getenv("MAX_ORDER_NOTIONAL_USDT", "100"))
 DEFAULT_ORDER_NOTIONAL_USDT = float(os.getenv("DEFAULT_ORDER_NOTIONAL_USDT", "50"))
 DEFAULT_FUTURES_LEVERAGE = int(os.getenv("DEFAULT_FUTURES_LEVERAGE", "1"))
-
-TARGET_APY = float(os.getenv("TARGET_APY", "0.16"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -100,7 +140,10 @@ def utc_text() -> str:
 def fmt_pct(x: Optional[float], digits: int = 4) -> str:
     if x is None:
         return "N/A"
-    return f"{x * 100:.{digits}f}%"
+    try:
+        return f"{float(x) * 100:.{digits}f}%"
+    except Exception:
+        return "N/A"
 
 
 def norm_symbol(s: str) -> str:
@@ -113,6 +156,15 @@ def ensure_data_dir():
         os.makedirs(d, exist_ok=True)
 
 
+def safe_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
 # =========================
 # SQLite DB
 # =========================
@@ -121,6 +173,7 @@ class RadarDB:
         self.path = path
         ensure_data_dir()
         self.init_db()
+        self.ensure_scan_result_columns()
 
     def conn(self):
         return sqlite3.connect(self.path, timeout=30)
@@ -159,12 +212,20 @@ class RadarDB:
                 symbol TEXT NOT NULL,
                 status TEXT NOT NULL,
                 signal_level TEXT,
+                arb_direction TEXT,
                 current_funding_rate REAL,
                 avg_funding_rate_7d REAL,
                 std_funding_rate_7d REAL,
                 positive_ratio_7d REAL,
                 recent_avg_funding_rate REAL,
                 apy REAL,
+                gross_apy REAL,
+                net_apy REAL,
+                entry_cost_rate REAL,
+                roundtrip_cost_rate REAL,
+                daily_funding_yield REAL,
+                daily_cost_drag REAL,
+                expected_hold_days REAL,
                 payback_days REAL,
                 basis_rate REAL,
                 spot_slippage REAL,
@@ -216,6 +277,29 @@ class RadarDB:
         self.set_default("scanner_paused", "false")
         self.set_default("telegram_paused", "false")
 
+    def ensure_scan_result_columns(self):
+        columns_to_add = {
+            "arb_direction": "TEXT",
+            "gross_apy": "REAL",
+            "net_apy": "REAL",
+            "entry_cost_rate": "REAL",
+            "roundtrip_cost_rate": "REAL",
+            "daily_funding_yield": "REAL",
+            "daily_cost_drag": "REAL",
+            "expected_hold_days": "REAL",
+        }
+
+        with self.conn() as con:
+            rows = con.execute("PRAGMA table_info(scan_results)").fetchall()
+            existing_cols = {r[1] for r in rows}
+
+            for col, col_type in columns_to_add.items():
+                if col not in existing_cols:
+                    logger.info(f"DB migrate: add column scan_results.{col}")
+                    con.execute(f"ALTER TABLE scan_results ADD COLUMN {col} {col_type}")
+
+            con.commit()
+
     def set_default(self, key: str, value: str):
         with self.conn() as con:
             con.execute(
@@ -265,29 +349,67 @@ class RadarDB:
         with self.conn() as con:
             con.execute("""
             INSERT INTO scan_results (
-                ts,symbol,status,signal_level,current_funding_rate,
-                avg_funding_rate_7d,std_funding_rate_7d,positive_ratio_7d,
-                recent_avg_funding_rate,apy,payback_days,basis_rate,
-                spot_slippage,futures_slippage,total_slippage,quote_volume,
-                open_interest_notional,mark_price,fail_reason
+                ts,
+                symbol,
+                status,
+                signal_level,
+                arb_direction,
+
+                current_funding_rate,
+                avg_funding_rate_7d,
+                std_funding_rate_7d,
+                positive_ratio_7d,
+                recent_avg_funding_rate,
+
+                apy,
+                gross_apy,
+                net_apy,
+                entry_cost_rate,
+                roundtrip_cost_rate,
+                daily_funding_yield,
+                daily_cost_drag,
+                expected_hold_days,
+
+                payback_days,
+                basis_rate,
+                spot_slippage,
+                futures_slippage,
+                total_slippage,
+
+                quote_volume,
+                open_interest_notional,
+                mark_price,
+                fail_reason
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 row.get("ts", now_ts()),
                 row.get("symbol"),
                 row.get("status"),
                 row.get("signal_level"),
+                row.get("arb_direction", "FORWARD"),
+
                 row.get("current_funding_rate"),
                 row.get("avg_funding_rate_7d"),
                 row.get("std_funding_rate_7d"),
                 row.get("positive_ratio_7d"),
                 row.get("recent_avg_funding_rate"),
+
                 row.get("apy"),
+                row.get("gross_apy"),
+                row.get("net_apy"),
+                row.get("entry_cost_rate"),
+                row.get("roundtrip_cost_rate"),
+                row.get("daily_funding_yield"),
+                row.get("daily_cost_drag"),
+                row.get("expected_hold_days"),
+
                 row.get("payback_days"),
                 row.get("basis_rate"),
                 row.get("spot_slippage"),
                 row.get("futures_slippage"),
                 row.get("total_slippage"),
+
                 row.get("quote_volume"),
                 row.get("open_interest_notional"),
                 row.get("mark_price"),
@@ -519,17 +641,10 @@ class Trader:
             self.db.insert_trade(intent["id"], symbol, "DRY_RUN_HEDGE_ENTRY", notional, result)
             return result
 
-        # 注意：
-        # 這裡保守地不直接實作完整實盤下單，避免沒有狀態機就發生單邊成交風險。
-        # 若你確定要開實盤，下個版本應加入：
-        # 1. 交易對精度解析
-        # 2. 最小下單量檢查
-        # 3. 一邊成交、一邊失敗的緊急補救
-        # 4. 持倉 delta 校正
         return {
             "ok": False,
             "mode": "LIVE_NOT_IMPLEMENTED_SAFE_GUARD",
-            "message": "安全保護：此貼上版不直接執行實盤下單。請先使用 DRY_RUN。",
+            "message": "安全保護：此版本不直接執行實盤下單。請先使用 DRY_RUN。",
         }
 
 
@@ -658,14 +773,17 @@ def analyze_history(history: List[Dict[str, Any]], current_rate: float) -> Tuple
     max_abs = float(df["fundingRate"].abs().max())
     recent_avg = float(df["fundingRate"].tail(RECENT_FUNDING_CHECK_PERIODS).mean())
 
-    if pos_ratio <= POSITIVE_RATIO_THRESHOLD:
+    if pos_ratio < POSITIVE_RATIO_THRESHOLD:
         return None, f"正費率比例不足：{pos_ratio:.2f}"
 
-    if avg <= AVG_FUNDING_RATE_THRESHOLD:
+    if avg < AVG_FUNDING_RATE_THRESHOLD:
         return None, f"7日平均不足：{fmt_pct(avg)}"
 
     if std > MAX_FUNDING_STD_7D:
         return None, f"標準差過高：{fmt_pct(std)}"
+
+    if avg > 0 and (std / avg) > MAX_STD_TO_AVG_RATIO:
+        return None, f"標準差相對平均過高：{std / avg:.2f}"
 
     if max_abs > MAX_ABS_HISTORICAL_FUNDING_RATE:
         return None, f"歷史異常值過高：{fmt_pct(max_abs)}"
@@ -684,24 +802,70 @@ def analyze_history(history: List[Dict[str, Any]], current_rate: float) -> Tuple
     }, ""
 
 
-def calc_metrics(avg_rate: float, spot_slip: float, fut_slip: float) -> Dict[str, float]:
-    daily = avg_rate * 3
-    total_cost = SPOT_TAKER_FEE_RATE + FUTURES_TAKER_FEE_RATE + spot_slip + fut_slip
+def calc_daily_funding_yield(avg_funding_rate: float) -> float:
+    return safe_float(avg_funding_rate, 0.0) * 3
 
-    if daily <= 0:
-        return {"apy": 0.0, "payback_days": 999999.0}
+
+def calc_entry_cost_rate(spot_slip: float, fut_slip: float) -> float:
+    spot_slip = abs(safe_float(spot_slip, 0.0))
+    fut_slip = abs(safe_float(fut_slip, 0.0))
+
+    fee_rate = SPOT_TAKER_FEE_RATE + FUTURES_TAKER_FEE_RATE
+    slippage_rate = spot_slip + fut_slip
+
+    return fee_rate + slippage_rate
+
+
+def calc_roundtrip_cost_rate(spot_slip: float, fut_slip: float) -> float:
+    entry_cost = calc_entry_cost_rate(spot_slip, fut_slip)
+
+    if INCLUDE_EXIT_COST:
+        return entry_cost * 2
+
+    return entry_cost
+
+
+def calc_forward_net_metrics(avg_rate: float, spot_slip: float, fut_slip: float) -> Dict[str, float]:
+    avg_rate = safe_float(avg_rate, 0.0)
+
+    gross_apy = avg_rate * 3 * 365
+    entry_cost_rate = calc_entry_cost_rate(spot_slip, fut_slip)
+    roundtrip_cost_rate = calc_roundtrip_cost_rate(spot_slip, fut_slip)
+
+    daily_funding_yield = calc_daily_funding_yield(avg_rate)
+    expected_hold_days = max(safe_float(EXPECTED_HOLD_DAYS, 1.0), 1.0)
+    daily_cost_drag = roundtrip_cost_rate / expected_hold_days
+
+    if daily_funding_yield <= 0:
+        payback_days = 999999.0
+    else:
+        payback_days = roundtrip_cost_rate / daily_funding_yield
+
+    net_daily_yield = daily_funding_yield - daily_cost_drag
+    net_apy = net_daily_yield * 365
 
     return {
-        "apy": daily * 365,
-        "payback_days": total_cost / daily,
+        "apy": gross_apy,
+        "gross_apy": gross_apy,
+        "net_apy": net_apy,
+        "entry_cost_rate": entry_cost_rate,
+        "roundtrip_cost_rate": roundtrip_cost_rate,
+        "daily_funding_yield": daily_funding_yield,
+        "daily_cost_drag": daily_cost_drag,
+        "expected_hold_days": expected_hold_days,
+        "payback_days": payback_days,
     }
 
 
-def classify(payback: float) -> str:
-    if payback < STRONG_SIGNAL_PAYBACK_DAYS:
-        return "🔥 強訊號"
-    if payback < MAX_PAYBACK_DAYS:
-        return "✅ 可觀察"
+def classify(payback: float, net_apy: Optional[float] = None) -> str:
+    net_apy = safe_float(net_apy, 0.0)
+
+    if net_apy >= TARGET_NET_APY * 1.5 and payback <= STRONG_SIGNAL_PAYBACK_DAYS:
+        return "🔥 強正向淨利訊號"
+
+    if net_apy >= TARGET_NET_APY and payback <= MAX_PAYBACK_DAYS:
+        return "✅ 正向淨利通過"
+
     return "❌ 不符合"
 
 
@@ -714,10 +878,6 @@ class Telegram:
         self.db = db
         self.trader = trader
         self.offset = 0
-
-    # =========================
-    # Telegram 基礎工具
-    # =========================
 
     async def send(self, text: str) -> bool:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -744,9 +904,6 @@ class Telegram:
             return False
 
     def h(self, x: Any) -> str:
-        """
-        HTML escape，避免 Telegram HTML parse_mode 因特殊字元壞掉。
-        """
         if x is None:
             return ""
         return html.escape(str(x))
@@ -803,21 +960,31 @@ class Telegram:
 
     def target_text(self, apy) -> str:
         if apy is None:
-            return "無法判斷，因為年化收益率尚未計算"
+            return "無法判斷，因為毛年化尚未計算"
 
         try:
             apy_value = float(apy)
             gap = apy_value - TARGET_APY
 
             if gap >= 0:
-                return f"🔥 已達標，超過 {gap * 100:.2f}%"
-            return f"尚未達標，還差 {abs(gap) * 100:.2f}%"
+                return f"🔥 毛年化已達標，超過 {gap * 100:.2f}%"
+            return f"毛年化尚未達標，還差 {abs(gap) * 100:.2f}%"
         except Exception:
             return "無法判斷"
 
-    # =========================
-    # Telegram Polling
-    # =========================
+    def target_net_text(self, net_apy) -> str:
+        if net_apy is None:
+            return "無法判斷，因為真實淨年化尚未計算"
+
+        try:
+            net_apy_value = float(net_apy)
+            gap = net_apy_value - TARGET_NET_APY
+
+            if gap >= 0:
+                return f"🔥 淨年化已達標，超過 {gap * 100:.2f}%"
+            return f"淨年化尚未達標，還差 {abs(gap) * 100:.2f}%"
+        except Exception:
+            return "無法判斷"
 
     async def poll_loop(self):
         if not TELEGRAM_BOT_TOKEN:
@@ -855,10 +1022,6 @@ class Telegram:
             if text:
                 await self.handle(text)
 
-    # =========================
-    # 指令入口
-    # =========================
-
     async def handle(self, text: str):
         parts = text.split()
         if not parts:
@@ -886,6 +1049,9 @@ class Telegram:
 
             elif cmd == "/top16":
                 await self.cmd_top16()
+
+            elif cmd == "/topnet":
+                await self.cmd_topnet()
 
             elif cmd == "/why" and len(parts) >= 2:
                 symbol = norm_symbol(parts[1])
@@ -925,6 +1091,7 @@ class Telegram:
                     "未知指令，請輸入 /help 查看可用指令。\n\n"
                     "常用指令：\n"
                     "<code>/top</code>\n"
+                    "<code>/topnet</code>\n"
                     "<code>/top16</code>\n"
                     "<code>/why ETHUSDT</code>"
                 )
@@ -933,18 +1100,15 @@ class Telegram:
             logger.exception(f"Telegram command error: {e}")
             await self.send(f"❌ <b>指令錯誤</b>\n\n<code>{self.h(e)}</code>")
 
-    # =========================
-    # 說明與狀態
-    # =========================
-
     def help_text(self) -> str:
         return (
             "🤖 <b>Funding Radar 指令說明</b>\n\n"
 
             "📊 <b>監控查詢</b>\n"
             "/status - 查看系統狀態\n"
-            "/top - 查看目前最新通過訊號\n"
-            "/top16 - 查看達到目標年化的訊號\n"
+            "/top - 查看目前最新真實淨利通過訊號\n"
+            "/topnet - 查看真實淨年化達標訊號\n"
+            "/top16 - 查看達到目標毛年化的訊號\n"
             "/why SYMBOL - 查看某交易對為什麼通過或未通過\n\n"
 
             "⏸ <b>掃描控制</b>\n"
@@ -962,11 +1126,16 @@ class Telegram:
 
             "📌 <b>範例</b>\n"
             "<code>/top</code>\n"
+            "<code>/topnet</code>\n"
             "<code>/top16</code>\n"
             "<code>/why ETHUSDT</code>\n"
             "<code>/order DOGEUSDT 50</code>\n\n"
 
-            f"🎯 目前目標年化：<b>{TARGET_APY * 100:.2f}%</b>\n\n"
+            f"🎯 目標毛年化：<b>{TARGET_APY * 100:.2f}%</b>\n"
+            f"💰 目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>\n"
+            f"⏳ 預估持倉天數：<b>{EXPECTED_HOLD_DAYS:.0f} 天</b>\n"
+            f"🔁 是否計入出場成本：<b>{INCLUDE_EXIT_COST}</b>\n\n"
+
             "⚠️ 訊號僅供監控，不代表投資建議。"
         )
 
@@ -976,12 +1145,7 @@ class Telegram:
 
         with self.db.conn() as con:
             scan_count = con.execute("SELECT COUNT(*) FROM scan_results").fetchone()[0]
-
-            latest_ts_row = con.execute("""
-                SELECT MAX(ts)
-                FROM scan_results
-            """).fetchone()
-
+            latest_ts_row = con.execute("SELECT MAX(ts) FROM scan_results").fetchone()
             latest_ts = latest_ts_row[0] if latest_ts_row else None
 
             pass_count = con.execute("""
@@ -989,6 +1153,14 @@ class Telegram:
                 FROM scan_results
                 WHERE status='PASS'
             """).fetchone()[0]
+
+            net_pass_count = con.execute("""
+                SELECT COUNT(*)
+                FROM scan_results
+                WHERE status='PASS'
+                  AND net_apy IS NOT NULL
+                  AND net_apy >= ?
+            """, (TARGET_NET_APY,)).fetchone()[0]
 
             watch_count = con.execute("""
                 SELECT COUNT(*)
@@ -1001,18 +1173,21 @@ class Telegram:
             f"掃描狀態：<code>{'暫停' if scanner_paused.lower() == 'true' else '運行中'}</code>\n"
             f"Telegram 狀態：<code>{'暫停' if telegram_paused.lower() == 'true' else '運行中'}</code>\n"
             f"是否允許實盤交易：<code>{ENABLE_TRADING}</code>\n"
-            f"是否模擬交易 DRY_RUN：<code>{DRY_RUN}</code>\n"
-            f"目標年化：<b>{TARGET_APY * 100:.2f}%</b>\n"
+            f"是否模擬交易 DRY_RUN：<code>{DRY_RUN}</code>\n\n"
+
+            f"策略方向：<b>正向套利｜買現貨 + 空合約</b>\n"
+            f"目標毛年化：<b>{TARGET_APY * 100:.2f}%</b>\n"
+            f"目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>\n"
+            f"預估持倉天數：<b>{EXPECTED_HOLD_DAYS:.0f} 天</b>\n"
+            f"完整進出場成本：<code>{INCLUDE_EXIT_COST}</code>\n"
             f"資料庫路徑：<code>{self.h(DB_PATH)}</code>\n\n"
+
             f"scan_results 總筆數：<b>{scan_count}</b>\n"
             f"歷史 PASS 筆數：<b>{pass_count}</b>\n"
+            f"真實淨利達標 PASS 筆數：<b>{net_pass_count}</b>\n"
             f"歷史 WATCH 筆數：<b>{watch_count}</b>\n"
             f"最後更新：<code>{self.fmt_time(latest_ts)}</code>"
         )
-
-    # =========================
-    # /top 最新通過訊號
-    # =========================
 
     async def cmd_top(self):
         lookback_seconds = 24 * 60 * 60
@@ -1035,51 +1210,61 @@ class Telegram:
             FROM ranked
             WHERE rn = 1
               AND UPPER(status) = 'PASS'
+              AND COALESCE(arb_direction, 'FORWARD') = 'FORWARD'
+              AND net_apy IS NOT NULL
+              AND net_apy >= ?
             ORDER BY
-                COALESCE(payback_days, 999999) ASC,
-                COALESCE(apy, 0) DESC
+                COALESCE(net_apy, 0) DESC,
+                COALESCE(payback_days, 999999) ASC
             LIMIT 10
-            """, (since_ts,)).fetchall()
+            """, (since_ts, TARGET_NET_APY)).fetchall()
 
         if not rows:
             await self.send(
-                "目前沒有通過訊號。\n\n"
+                "目前沒有真實淨利通過訊號。\n\n"
                 "說明：/top 只顯示最近 24 小時內，"
-                "每個交易對最新一筆仍為 PASS 的標的。"
+                "每個交易對最新一筆仍為 PASS，且真實淨年化達標的正向套利標的。\n\n"
+                "你也可以使用：\n"
+                "<code>/top16</code> 查看毛年化達標標的\n"
+                "<code>/why ETHUSDT</code> 查看單一交易對診斷"
             )
             return
 
         lines = [
-            "🏆 <b>最新通過訊號</b>",
-            "<code>每個交易對只顯示最新一筆｜最近 24 小時</code>",
-            f"目標年化：<b>{TARGET_APY * 100:.2f}%</b>",
+            "🏆 <b>最新真實淨利通過訊號</b>",
+            "<code>正向套利：買現貨 + 空合約｜最近 24 小時</code>",
+            f"目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>",
         ]
 
         for i, r in enumerate(rows, 1):
             symbol = self.row_get(r, "symbol", "")
-            signal_level = self.row_get(r, "signal_level", "") or "✅ 可觀察"
+            signal_level = self.row_get(r, "signal_level", "") or "✅ 正向淨利通過"
 
             lines.append(
                 f"\n#{i} <b>{self.h(symbol)}</b>｜{self.h(signal_level)}\n"
                 f"時間：<code>{self.fmt_time(self.row_get(r, 'ts'))}</code>\n"
+                f"方向：<b>買現貨 + 空合約</b>\n"
                 f"當前資金費率：{fmt_pct(self.row_get(r, 'current_funding_rate'))}\n"
                 f"7日平均資金費率：{fmt_pct(self.row_get(r, 'avg_funding_rate_7d'))}\n"
-                f"年化收益率：<b>{fmt_pct(self.row_get(r, 'apy'), 2)}</b>\n"
-                f"16% 目標：<b>{self.target_text(self.row_get(r, 'apy'))}</b>\n"
+                f"毛年化：<b>{fmt_pct(self.row_get(r, 'gross_apy') or self.row_get(r, 'apy'), 2)}</b>\n"
+                f"真實淨年化：<b>{fmt_pct(self.row_get(r, 'net_apy'), 2)}</b>\n"
+                f"淨利目標：<b>{self.target_net_text(self.row_get(r, 'net_apy'))}</b>\n"
                 f"回本天數：{self.fmt_days(self.row_get(r, 'payback_days'))}\n"
-                f"現貨合約價差：{fmt_pct(self.row_get(r, 'basis_rate'))}\n"
+                f"完整進出場成本：{fmt_pct(self.row_get(r, 'roundtrip_cost_rate'), 4)}\n"
+                f"每日 funding 收益：{fmt_pct(self.row_get(r, 'daily_funding_yield'), 4)}\n"
+                f"每日成本攤提：{fmt_pct(self.row_get(r, 'daily_cost_drag'), 4)}\n"
+                f"Basis：{fmt_pct(self.row_get(r, 'basis_rate'))}\n"
                 f"總滑點：{fmt_pct(self.row_get(r, 'total_slippage'))}\n"
                 f"24H 成交額：<code>{self.fmt_money(self.row_get(r, 'quote_volume'))}</code>\n"
-                f"合約未平倉名目價值：<code>{self.fmt_money(self.row_get(r, 'open_interest_notional'))}</code>\n"
+                f"合約 OI 名目價值：<code>{self.fmt_money(self.row_get(r, 'open_interest_notional'))}</code>\n"
                 f"半自動：<code>/order {self.h(symbol)} {DEFAULT_ORDER_NOTIONAL_USDT}</code>\n"
                 f"原因查詢：<code>/why {self.h(symbol)}</code>"
             )
 
         await self.send("\n".join(lines))
 
-    # =========================
-    # /top16 目標年化訊號
-    # =========================
+    async def cmd_topnet(self):
+        await self.cmd_top()
 
     async def cmd_top16(self):
         lookback_seconds = 24 * 60 * 60
@@ -1101,63 +1286,58 @@ class Telegram:
             SELECT *
             FROM ranked
             WHERE rn = 1
-              AND apy IS NOT NULL
-              AND apy >= ?
+              AND COALESCE(gross_apy, apy) IS NOT NULL
+              AND COALESCE(gross_apy, apy) >= ?
             ORDER BY
-                apy DESC,
+                COALESCE(gross_apy, apy, 0) DESC,
                 COALESCE(payback_days, 999999) ASC
             LIMIT 10
             """, (since_ts, TARGET_APY)).fetchall()
 
         if not rows:
             await self.send(
-                "🔥 <b>目標年化訊號</b>\n\n"
-                f"目前沒有交易對達到目標年化 <b>{TARGET_APY * 100:.2f}%</b>。\n\n"
-                "這通常代表：\n"
-                "- 目前市場資金費率不夠高\n"
-                "- 或 funding 高的標的被 Basis、滑點、成交量、OI、穩定性條件過濾掉\n\n"
+                "🔥 <b>目標毛年化訊號</b>\n\n"
+                f"目前沒有交易對達到目標毛年化 <b>{TARGET_APY * 100:.2f}%</b>。\n\n"
                 "你可以用：\n"
-                "<code>/top</code> 查看一般通過訊號\n"
+                "<code>/top</code> 查看真實淨利通過訊號\n"
                 "<code>/why ETHUSDT</code> 查單一交易對原因"
             )
             return
 
         lines = [
-            "🔥 <b>目標年化訊號</b>",
+            "🔥 <b>目標毛年化訊號</b>",
             "<code>每個交易對只顯示最新一筆｜最近 24 小時</code>",
-            f"目標年化：<b>{TARGET_APY * 100:.2f}%</b>",
+            f"目標毛年化：<b>{TARGET_APY * 100:.2f}%</b>",
+            "提醒：毛年化達標不代表真實淨年化達標。",
         ]
 
         for i, r in enumerate(rows, 1):
             symbol = self.row_get(r, "symbol", "")
-            apy = self.row_get(r, "apy")
-            gap_text = "N/A"
+            gross_apy = self.row_get(r, "gross_apy") or self.row_get(r, "apy")
+            net_apy = self.row_get(r, "net_apy")
 
+            gap_text = "N/A"
             try:
-                gap = float(apy) - TARGET_APY
+                gap = float(gross_apy) - TARGET_APY
                 gap_text = f"+{gap * 100:.2f}%" if gap >= 0 else f"{gap * 100:.2f}%"
             except Exception:
                 pass
 
             lines.append(
-                f"\n#{i} <b>{self.h(symbol)}</b>｜🔥 已達標\n"
+                f"\n#{i} <b>{self.h(symbol)}</b>｜🔥 毛年化達標\n"
                 f"時間：<code>{self.fmt_time(self.row_get(r, 'ts'))}</code>\n"
-                f"年化收益率：<b>{fmt_pct(apy, 2)}</b>\n"
-                f"超過目標：<b>{gap_text}</b>\n"
+                f"毛年化：<b>{fmt_pct(gross_apy, 2)}</b>\n"
+                f"真實淨年化：<b>{fmt_pct(net_apy, 2)}</b>\n"
+                f"超過毛目標：<b>{gap_text}</b>\n"
                 f"當前資金費率：{fmt_pct(self.row_get(r, 'current_funding_rate'))}\n"
                 f"7日平均資金費率：{fmt_pct(self.row_get(r, 'avg_funding_rate_7d'))}\n"
                 f"回本天數：{self.fmt_days(self.row_get(r, 'payback_days'))}\n"
-                f"現貨合約價差：{fmt_pct(self.row_get(r, 'basis_rate'))}\n"
+                f"完整進出場成本：{fmt_pct(self.row_get(r, 'roundtrip_cost_rate'), 4)}\n"
                 f"總滑點：{fmt_pct(self.row_get(r, 'total_slippage'))}\n"
-                f"半自動：<code>/order {self.h(symbol)} {DEFAULT_ORDER_NOTIONAL_USDT}</code>\n"
                 f"原因查詢：<code>/why {self.h(symbol)}</code>"
             )
 
         await self.send("\n".join(lines))
-
-    # =========================
-    # /why SYMBOL 診斷
-    # =========================
 
     async def cmd_why(self, symbol: str):
         with self.db.conn() as con:
@@ -1176,16 +1356,15 @@ class Telegram:
                 "查無這個交易對的掃描資料。\n\n"
                 "可能原因：\n"
                 "1. 這個交易對尚未被掃描到\n"
-                "2. 當前資金費率低於初步門檻，所以沒有寫入資料庫\n"
+                "2. 當前資金費率低於初步門檻\n"
                 "3. 現貨或合約市場不符合系統條件\n"
-                "4. 剛部署完成，資料還沒累積\n\n"
-                "如果你想讓 BTCUSDT / ETHUSDT 即使 funding 很低也被記錄，"
-                "下一步可以加入 ALWAYS_TRACK_SYMBOLS 白名單功能。"
+                "4. 剛部署完成，資料還沒累積"
             )
             return
 
         status = str(self.row_get(row, "status", "")).upper()
-        apy = self.row_get(row, "apy")
+        gross_apy = self.row_get(row, "gross_apy") or self.row_get(row, "apy")
+        net_apy = self.row_get(row, "net_apy")
         avg_rate = self.row_get(row, "avg_funding_rate_7d")
         current_rate = self.row_get(row, "current_funding_rate")
         fail_reason = self.row_get(row, "fail_reason", "")
@@ -1193,16 +1372,19 @@ class Telegram:
         explanation = []
 
         if status == "PASS":
-            explanation.append("此交易對目前通過你的篩選條件。")
+            explanation.append("此交易對目前通過正向套利真實淨利篩選。")
         elif status == "WATCH":
             explanation.append("此交易對目前列為觀察，通常代表當前資金費率偏高，但歷史穩定性或其他條件尚未完全通過。")
         elif status == "FAIL":
-            explanation.append("此交易對目前未通過篩選條件。")
+            explanation.append("此交易對目前未通過正向套利篩選。")
         else:
             explanation.append("此交易對目前狀態不明，請檢查資料庫欄位。")
 
-        if apy is None:
-            explanation.append("年化收益率沒有計算出來，通常代表它在計算 APY 之前就已被某個條件擋下。")
+        if gross_apy is None:
+            explanation.append("毛年化收益率沒有計算出來，通常代表它在計算 APY 之前就已被某個條件擋下。")
+
+        if net_apy is None:
+            explanation.append("真實淨年化沒有計算出來，通常代表它在成本計算前已被擋下。")
 
         if avg_rate is None:
             explanation.append("7日平均資金費率為空，可能是歷史 funding 資料不足，或尚未進入穩定性計算階段。")
@@ -1210,21 +1392,32 @@ class Telegram:
         if fail_reason:
             explanation.append(f"未通過原因：{fail_reason}")
 
-        if not explanation:
-            explanation.append("目前沒有額外診斷資訊。")
-
         msg = (
             f"🔎 <b>{self.h(symbol)} 訊號診斷</b>\n\n"
             f"最新狀態：<b>{self.status_text(status)}</b>\n"
-            f"時間：<code>{self.fmt_time(self.row_get(row, 'ts'))}</code>\n\n"
+            f"時間：<code>{self.fmt_time(self.row_get(row, 'ts'))}</code>\n"
+            f"方向：<b>正向套利｜買現貨 + 空合約</b>\n\n"
 
             f"當前資金費率：{fmt_pct(current_rate)}\n"
             f"7日平均資金費率：{fmt_pct(avg_rate)}\n"
-            f"年化收益率：<b>{fmt_pct(apy, 2)}</b>\n"
-            f"目標年化：<b>{TARGET_APY * 100:.2f}%</b>\n"
-            f"目標狀態：<b>{self.target_text(apy)}</b>\n\n"
+            f"正費率比例：{fmt_pct(self.row_get(row, 'positive_ratio_7d'), 2)}\n"
+            f"Funding 標準差：{fmt_pct(self.row_get(row, 'std_funding_rate_7d'))}\n"
+            f"近期平均資金費率：{fmt_pct(self.row_get(row, 'recent_avg_funding_rate'))}\n\n"
+
+            f"毛年化：<b>{fmt_pct(gross_apy, 2)}</b>\n"
+            f"真實淨年化：<b>{fmt_pct(net_apy, 2)}</b>\n"
+            f"目標毛年化：<b>{TARGET_APY * 100:.2f}%</b>\n"
+            f"目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>\n"
+            f"毛年化狀態：<b>{self.target_text(gross_apy)}</b>\n"
+            f"淨年化狀態：<b>{self.target_net_text(net_apy)}</b>\n\n"
 
             f"回本天數：{self.fmt_days(self.row_get(row, 'payback_days'))}\n"
+            f"進場成本率：{fmt_pct(self.row_get(row, 'entry_cost_rate'), 4)}\n"
+            f"完整進出場成本率：{fmt_pct(self.row_get(row, 'roundtrip_cost_rate'), 4)}\n"
+            f"每日 funding 收益率：{fmt_pct(self.row_get(row, 'daily_funding_yield'), 4)}\n"
+            f"每日成本攤提率：{fmt_pct(self.row_get(row, 'daily_cost_drag'), 4)}\n"
+            f"預估持倉天數：<code>{self.row_get(row, 'expected_hold_days')}</code>\n\n"
+
             f"現貨合約價差：{fmt_pct(self.row_get(row, 'basis_rate'))}\n"
             f"現貨滑點：{fmt_pct(self.row_get(row, 'spot_slippage'))}\n"
             f"合約滑點：{fmt_pct(self.row_get(row, 'futures_slippage'))}\n"
@@ -1238,10 +1431,6 @@ class Telegram:
         )
 
         await self.send(msg)
-
-    # =========================
-    # 半自動下單
-    # =========================
 
     async def cmd_order(self, symbol: str, notional: float):
         if notional <= 0 or notional > MAX_ORDER_NOTIONAL_USDT:
@@ -1297,6 +1486,7 @@ class Telegram:
             "✅ <b>已取消下單意圖</b>\n\n"
             f"確認碼：<code>{self.h(code)}</code>"
         )
+
 
 # =========================
 # Scanner
@@ -1361,6 +1551,7 @@ class Scanner:
             if mark_price <= 0:
                 continue
 
+            # 正向套利只接受正 funding，且要高於門檻
             if current_rate <= CURRENT_FUNDING_RATE_THRESHOLD:
                 continue
 
@@ -1399,7 +1590,12 @@ class Scanner:
             elif r["status"] == "WATCH":
                 watched.append(r)
 
-        passed.sort(key=lambda x: (x.get("payback_days") or 9999, -(x.get("apy") or 0)))
+        passed.sort(
+            key=lambda x: (
+                -(x.get("net_apy") or 0),
+                x.get("payback_days") or 999999,
+            )
+        )
         watched.sort(key=lambda x: x.get("current_funding_rate") or 0, reverse=True)
 
         await self.alert(passed[:10], watched[:5])
@@ -1411,12 +1607,23 @@ class Scanner:
         row = {
             "ts": now_ts(),
             "symbol": symbol,
+            "arb_direction": "FORWARD",
             "current_funding_rate": c["current_funding_rate"],
             "quote_volume": c["quote_volume"],
             "mark_price": c["mark_price"],
         }
 
         try:
+            current_rate = c["current_funding_rate"]
+
+            if current_rate <= 0:
+                row.update({"status": "FAIL", "fail_reason": f"非正資金費率，不適合正向套利：{current_rate:.6f}"})
+                return row
+
+            if current_rate < CURRENT_FUNDING_RATE_THRESHOLD:
+                row.update({"status": "FAIL", "fail_reason": f"當前資金費率不足：{current_rate:.6f}"})
+                return row
+
             oi, spot_book, fut_book, hist = await asyncio.gather(
                 self.api.open_interest(symbol),
                 self.api.spot_depth(symbol),
@@ -1446,8 +1653,12 @@ class Scanner:
                 return row
 
             if USE_DYNAMIC_SLIPPAGE_COST:
+                # 正向套利進場：
+                # 現貨買入吃 asks
+                # 合約開空等同賣出吃 bids
                 spot_slip = estimate_buy_slippage(spot_book, SLIPPAGE_TEST_NOTIONAL_USDT)
                 fut_slip = estimate_sell_slippage(fut_book, SLIPPAGE_TEST_NOTIONAL_USDT)
+
                 if spot_slip is None or fut_slip is None:
                     row.update({"status": "FAIL", "fail_reason": "order book 深度不足"})
                     return row
@@ -1467,10 +1678,10 @@ class Scanner:
                 row.update({"status": "FAIL", "fail_reason": f"滑點過高：{fmt_pct(total_slip)}"})
                 return row
 
-            stability, fail_reason = analyze_history(hist, c["current_funding_rate"])
+            stability, fail_reason = analyze_history(hist, current_rate)
 
             if stability is None:
-                if ENABLE_HIGH_RISK_WATCHLIST and c["current_funding_rate"] >= HIGH_RISK_CURRENT_RATE_THRESHOLD:
+                if ENABLE_HIGH_RISK_WATCHLIST and current_rate >= HIGH_RISK_CURRENT_RATE_THRESHOLD:
                     row.update({
                         "status": "WATCH",
                         "signal_level": "⚠️ 高風險觀察",
@@ -1481,114 +1692,6 @@ class Scanner:
                 row.update({"status": "FAIL", "fail_reason": fail_reason})
                 return row
 
-            metrics = calc_metrics(stability["avg_funding_rate_7d"], spot_slip, fut_slip)
-
-            row.update(stability)
-            row.update(metrics)
-
-            if metrics["payback_days"] >= MAX_PAYBACK_DAYS:
-                row.update({
-                    "status": "FAIL",
-                    "fail_reason": f"回本天數過長：{metrics['payback_days']:.2f}",
-                })
-                return row
-
-            row.update({
-                "status": "PASS",
-                "signal_level": classify(metrics["payback_days"]),
-            })
-            return row
-
-        except Exception as e:
-            row.update({"status": "FAIL", "fail_reason": str(e)})
-            return row
-
-    async def alert(self, passed: List[Dict[str, Any]], watched: List[Dict[str, Any]]):
-        send_pass = []
-        send_watch = []
-
-        for t in passed:
-            key = f"PASS:{t['symbol']}"
-            if self.db.should_alert(key):
-                self.db.mark_alert(key)
-                send_pass.append(t)
-
-        for t in watched:
-            key = f"WATCH:{t['symbol']}"
-            if self.db.should_alert(key):
-                self.db.mark_alert(key)
-                send_watch.append(t)
-
-        if not send_pass and not send_watch:
-            return
-
-        lines = [
-            "🚨 <b>Funding Radar V2</b>",
-            f"時間：<code>{utc_text()}</code>",
-            f"PASS：<b>{len(send_pass)}</b>",
-            f"WATCH：<b>{len(send_watch)}</b>",
-            "",
-        ]
-
-        if send_pass:
-            lines.append("✅ <b>符合條件標的</b>")
-            for i, t in enumerate(send_pass, 1):
-                lines.extend([
-                    "",
-                    f"#{i} <b>{t['symbol']}</b>｜{t.get('signal_level')}",
-                    f"當前費率：<b>{fmt_pct(t.get('current_funding_rate'))}</b>",
-                    f"7日平均：<b>{fmt_pct(t.get('avg_funding_rate_7d'))}</b>",
-                    f"APY：<b>{fmt_pct(t.get('apy'), 2)}</b>",
-                    f"回本：<b>{t.get('payback_days', 0):.2f} 天</b>",
-                    f"Basis：<b>{fmt_pct(t.get('basis_rate'))}</b>",
-                    f"總滑點：<b>{fmt_pct(t.get('total_slippage'))}</b>",
-                    f"半自動：<code>/order {t['symbol']} {DEFAULT_ORDER_NOTIONAL_USDT}</code>",
-                ])
-
-        if send_watch:
-            lines.extend(["", "⚠️ <b>高風險觀察</b>"])
-            for i, t in enumerate(send_watch, 1):
-                lines.extend([
-                    "",
-                    f"#{i} <b>{t['symbol']}</b>",
-                    f"當前費率：<b>{fmt_pct(t.get('current_funding_rate'))}</b>",
-                    f"原因：<code>{t.get('fail_reason')}</code>",
-                ])
-
-        lines.extend([
-            "",
-            "⚠️ 僅供監控，不代表投資建議。實盤請先 DRY_RUN。",
-        ])
-
-        await self.tg.send("\n".join(lines))
-
-
-# =========================
-# Main
-# =========================
-async def main():
-    logger.info("Funding Radar V2 starting")
-
-    db = RadarDB(DB_PATH)
-
-    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
-    sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        http = Http(session, sem)
-        api = BinancePublic(http)
-        trader = Trader(http, db)
-        tg = Telegram(session, db, trader)
-        scanner = Scanner(db, api, tg)
-
-        await asyncio.gather(
-            scanner.loop(),
-            tg.poll_loop(),
-        )
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Stopped")
+            metrics = calc_forward_net_metrics(
+                stability["avg_funding_rate_7d"],
+                spot_sl
