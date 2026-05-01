@@ -1596,7 +1596,11 @@ class Scanner:
                 x.get("payback_days") or 999999,
             )
         )
-        watched.sort(key=lambda x: x.get("current_funding_rate") or 0, reverse=True)
+
+        watched.sort(
+            key=lambda x: x.get("current_funding_rate") or 0,
+            reverse=True,
+        )
 
         await self.alert(passed[:10], watched[:5])
         logger.info(f"掃描完成 PASS={len(passed)} WATCH={len(watched)}")
@@ -1617,11 +1621,17 @@ class Scanner:
             current_rate = c["current_funding_rate"]
 
             if current_rate <= 0:
-                row.update({"status": "FAIL", "fail_reason": f"非正資金費率，不適合正向套利：{current_rate:.6f}"})
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"非正資金費率，不適合正向套利：{current_rate:.6f}",
+                })
                 return row
 
             if current_rate < CURRENT_FUNDING_RATE_THRESHOLD:
-                row.update({"status": "FAIL", "fail_reason": f"當前資金費率不足：{current_rate:.6f}"})
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"當前資金費率不足：{current_rate:.6f}",
+                })
                 return row
 
             oi, spot_book, fut_book, hist = await asyncio.gather(
@@ -1635,32 +1645,48 @@ class Scanner:
             row["open_interest_notional"] = oi_notional
 
             if oi_notional < MIN_OPEN_INTEREST_NOTIONAL_USDT:
-                row.update({"status": "FAIL", "fail_reason": "OI 名目價值不足"})
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"OI 名目價值不足：{oi_notional:.0f}",
+                })
                 return row
 
             spot_mid = orderbook_mid(spot_book)
             fut_mid = orderbook_mid(fut_book)
 
             if not spot_mid or not fut_mid:
-                row.update({"status": "FAIL", "fail_reason": "order book mid 無效"})
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": "order book mid 無效",
+                })
                 return row
 
             basis = fut_mid / spot_mid - 1
             row["basis_rate"] = basis
 
             if abs(basis) > MAX_ABS_BASIS_RATE:
-                row.update({"status": "FAIL", "fail_reason": f"Basis 過大：{fmt_pct(basis)}"})
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"Basis 過大：{fmt_pct(basis)}",
+                })
                 return row
 
             if USE_DYNAMIC_SLIPPAGE_COST:
-                # 正向套利進場：
-                # 現貨買入吃 asks
-                # 合約開空等同賣出吃 bids
-                spot_slip = estimate_buy_slippage(spot_book, SLIPPAGE_TEST_NOTIONAL_USDT)
-                fut_slip = estimate_sell_slippage(fut_book, SLIPPAGE_TEST_NOTIONAL_USDT)
+                spot_slip = estimate_buy_slippage(
+                    spot_book,
+                    SLIPPAGE_TEST_NOTIONAL_USDT,
+                )
+
+                fut_slip = estimate_sell_slippage(
+                    fut_book,
+                    SLIPPAGE_TEST_NOTIONAL_USDT,
+                )
 
                 if spot_slip is None or fut_slip is None:
-                    row.update({"status": "FAIL", "fail_reason": "order book 深度不足"})
+                    row.update({
+                        "status": "FAIL",
+                        "fail_reason": "order book 深度不足",
+                    })
                     return row
             else:
                 spot_slip = 0.0
@@ -1675,13 +1701,22 @@ class Scanner:
             })
 
             if total_slip > MAX_TOTAL_SLIPPAGE_RATE:
-                row.update({"status": "FAIL", "fail_reason": f"滑點過高：{fmt_pct(total_slip)}"})
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"滑點過高：{fmt_pct(total_slip)}",
+                })
                 return row
 
-            stability, fail_reason = analyze_history(hist, current_rate)
+            stability, fail_reason = analyze_history(
+                hist,
+                current_rate,
+            )
 
             if stability is None:
-                if ENABLE_HIGH_RISK_WATCHLIST and current_rate >= HIGH_RISK_CURRENT_RATE_THRESHOLD:
+                if (
+                    ENABLE_HIGH_RISK_WATCHLIST
+                    and current_rate >= HIGH_RISK_CURRENT_RATE_THRESHOLD
+                ):
                     row.update({
                         "status": "WATCH",
                         "signal_level": "⚠️ 高風險觀察",
@@ -1689,213 +1724,229 @@ class Scanner:
                     })
                     return row
 
-                row.update({"status": "FAIL", "fail_reason": fail_reason})
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": fail_reason,
+                })
                 return row
-              metrics = calc_forward_net_metrics(
-                  stability["avg_funding_rate_7d"],
-                  spot_slip,
-                  fut_slip,
-              )
 
-              row.update(stability)
-              row.update(metrics)
+            metrics = calc_forward_net_metrics(
+                stability["avg_funding_rate_7d"],
+                spot_slip,
+                fut_slip,
+            )
 
-              avg_rate = stability["avg_funding_rate_7d"]
-              std_rate = stability.get("std_funding_rate_7d")
-              positive_ratio = stability.get("positive_ratio_7d")
-              net_apy = metrics.get("net_apy")
-              payback_days = metrics.get("payback_days")
+            row.update(stability)
+            row.update(metrics)
 
-              # =========================
-              # 正向套利真實淨利版硬性過濾
-              # =========================
+            avg_rate = stability["avg_funding_rate_7d"]
+            std_rate = stability.get("std_funding_rate_7d")
+            positive_ratio = stability.get("positive_ratio_7d")
+            net_apy = metrics.get("net_apy")
+            payback_days = metrics.get("payback_days")
 
-              if current_rate <= 0:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"非正資金費率，不適合正向套利：{current_rate:.6f}",
-                  })
-                  return row
+            # =========================
+            # 正向套利真實淨利版硬性過濾
+            # =========================
 
-              if current_rate < CURRENT_FUNDING_RATE_THRESHOLD:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"當前資金費率不足：{current_rate:.6f}",
-                  })
-                  return row
+            if current_rate <= 0:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"非正資金費率，不適合正向套利：{current_rate:.6f}",
+                })
+                return row
 
-              if avg_rate < AVG_FUNDING_RATE_THRESHOLD:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"7日平均資金費率不足：{avg_rate:.6f}",
-                  })
-                  return row
+            if current_rate < CURRENT_FUNDING_RATE_THRESHOLD:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"當前資金費率不足：{current_rate:.6f}",
+                })
+                return row
 
-              if positive_ratio is not None and positive_ratio < POSITIVE_RATIO_THRESHOLD:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"正費率比例不足：{positive_ratio:.2f}",
-                  })
-                  return row
+            if avg_rate < AVG_FUNDING_RATE_THRESHOLD:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"7日平均資金費率不足：{avg_rate:.6f}",
+                })
+                return row
 
-              if std_rate is not None and std_rate > MAX_FUNDING_STD_7D:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"資金費率波動過大：{std_rate:.6f}",
-                  })
-                  return row
+            if positive_ratio is not None and positive_ratio < POSITIVE_RATIO_THRESHOLD:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"正費率比例不足：{positive_ratio:.2f}",
+                })
+                return row
 
-              if avg_rate > 0 and std_rate is not None and (std_rate / avg_rate) > MAX_STD_TO_AVG_RATIO:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"資金費率波動相對平均過大：{std_rate / avg_rate:.2f}",
-                  })
-                  return row
+            if std_rate is not None and std_rate > MAX_FUNDING_STD_7D:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"資金費率波動過大：{std_rate:.6f}",
+                })
+                return row
 
-              if total_slip > MAX_TOTAL_SLIPPAGE_RATE:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"總滑點過高：{fmt_pct(total_slip)}",
-                  })
-                  return row
+            if (
+                avg_rate > 0
+                and std_rate is not None
+                and (std_rate / avg_rate) > MAX_STD_TO_AVG_RATIO
+            ):
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"資金費率波動相對平均過大：{std_rate / avg_rate:.2f}",
+                })
+                return row
 
-              if payback_days is None or payback_days > MAX_PAYBACK_DAYS:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"回本天數過長：{safe_float(payback_days, 999999):.2f} 天",
-                  })
-                  return row
+            if total_slip > MAX_TOTAL_SLIPPAGE_RATE:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"總滑點過高：{fmt_pct(total_slip)}",
+                })
+                return row
 
-              if net_apy is None or net_apy < TARGET_NET_APY:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"扣除成本後真實淨年化不足：{safe_float(net_apy, 0.0) * 100:.2f}%",
-                  })
-                  return row
+            if payback_days is None or payback_days > MAX_PAYBACK_DAYS:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"回本天數過長：{safe_float(payback_days, 999999):.2f} 天",
+                })
+                return row
 
-              if c["quote_volume"] < MIN_24H_QUOTE_VOLUME_USDT:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"24H 成交額不足：{c['quote_volume']:.0f}",
-                  })
-                  return row
+            if net_apy is None or net_apy < TARGET_NET_APY:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"扣除成本後真實淨年化不足：{safe_float(net_apy, 0.0) * 100:.2f}%",
+                })
+                return row
 
-              if oi_notional < MIN_OPEN_INTEREST_NOTIONAL_USDT:
-                  row.update({
-                      "status": "FAIL",
-                      "fail_reason": f"合約未平倉名目價值不足：{oi_notional:.0f}",
-                  })
-                  return row
+            if c["quote_volume"] < MIN_24H_QUOTE_VOLUME_USDT:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"24H 成交額不足：{c['quote_volume']:.0f}",
+                })
+                return row
 
-              row.update({
-                  "status": "PASS",
-                  "signal_level": classify(payback_days, net_apy),
-              })
-              return row
+            if oi_notional < MIN_OPEN_INTEREST_NOTIONAL_USDT:
+                row.update({
+                    "status": "FAIL",
+                    "fail_reason": f"合約未平倉名目價值不足：{oi_notional:.0f}",
+                })
+                return row
 
-          except Exception as e:
-              row.update({
-                  "status": "FAIL",
-                  "fail_reason": str(e),
-              })
-              return row
+            row.update({
+                "status": "PASS",
+                "signal_level": classify(payback_days, net_apy),
+            })
 
-      async def alert(self, passed: List[Dict[str, Any]], watched: List[Dict[str, Any]]):
-          send_pass = []
-          send_watch = []
+            return row
 
-          for t in passed:
-              key = f"PASS:{t['symbol']}"
-              if self.db.should_alert(key):
-                  self.db.mark_alert(key)
-                  send_pass.append(t)
+        except Exception as e:
+            row.update({
+                "status": "FAIL",
+                "fail_reason": str(e),
+            })
+            return row
 
-          for t in watched:
-              key = f"WATCH:{t['symbol']}"
-              if self.db.should_alert(key):
-                  self.db.mark_alert(key)
-                  send_watch.append(t)
+    async def alert(
+        self,
+        passed: List[Dict[str, Any]],
+        watched: List[Dict[str, Any]],
+    ):
+        send_pass = []
+        send_watch = []
 
-          if not send_pass and not send_watch:
-              return
+        for t in passed:
+            key = f"PASS:{t['symbol']}"
+            if self.db.should_alert(key):
+                self.db.mark_alert(key)
+                send_pass.append(t)
 
-          lines = [
-              "🚨 <b>Funding Radar V2｜正向套利真實淨利版</b>",
-              f"時間：<code>{utc_text()}</code>",
-              f"PASS：<b>{len(send_pass)}</b>",
-              f"WATCH：<b>{len(send_watch)}</b>",
-              "",
-          ]
+        for t in watched:
+            key = f"WATCH:{t['symbol']}"
+            if self.db.should_alert(key):
+                self.db.mark_alert(key)
+                send_watch.append(t)
 
-          if send_pass:
-              lines.append("✅ <b>真實淨利通過標的</b>")
+        if not send_pass and not send_watch:
+            return
 
-              for i, t in enumerate(send_pass, 1):
-                  lines.extend([
-                      "",
-                      f"#{i} <b>{t['symbol']}</b>｜{t.get('signal_level')}",
-                      f"方向：<b>買現貨 + 空合約</b>",
-                      f"當前費率：<b>{fmt_pct(t.get('current_funding_rate'))}</b>",
-                      f"7日平均：<b>{fmt_pct(t.get('avg_funding_rate_7d'))}</b>",
-                      f"毛年化：<b>{fmt_pct(t.get('gross_apy') or t.get('apy'), 2)}</b>",
-                      f"真實淨年化：<b>{fmt_pct(t.get('net_apy'), 2)}</b>",
-                      f"回本：<b>{safe_float(t.get('payback_days'), 999999):.2f} 天</b>",
-                      f"完整成本：<b>{fmt_pct(t.get('roundtrip_cost_rate'), 4)}</b>",
-                      f"每日 funding：<b>{fmt_pct(t.get('daily_funding_yield'), 4)}</b>",
-                      f"每日成本攤提：<b>{fmt_pct(t.get('daily_cost_drag'), 4)}</b>",
-                      f"Basis：<b>{fmt_pct(t.get('basis_rate'))}</b>",
-                      f"總滑點：<b>{fmt_pct(t.get('total_slippage'))}</b>",
-                      f"半自動：<code>/order {t['symbol']} {DEFAULT_ORDER_NOTIONAL_USDT}</code>",
-                      f"診斷：<code>/why {t['symbol']}</code>",
-                  ])
+        lines = [
+            "🚨 <b>Funding Radar V2｜正向套利真實淨利版</b>",
+            f"時間：<code>{utc_text()}</code>",
+            f"PASS：<b>{len(send_pass)}</b>",
+            f"WATCH：<b>{len(send_watch)}</b>",
+            "",
+        ]
 
-          if send_watch:
-              lines.extend(["", "⚠️ <b>高風險觀察</b>"])
+        if send_pass:
+            lines.append("✅ <b>真實淨利通過標的</b>")
 
-              for i, t in enumerate(send_watch, 1):
-                  lines.extend([
-                      "",
-                      f"#{i} <b>{t['symbol']}</b>",
-                      f"當前費率：<b>{fmt_pct(t.get('current_funding_rate'))}</b>",
-                      f"原因：<code>{html.escape(str(t.get('fail_reason', '')))}</code>",
-                      f"診斷：<code>/why {t['symbol']}</code>",
-                  ])
+            for i, t in enumerate(send_pass, 1):
+                lines.extend([
+                    "",
+                    f"#{i} <b>{t['symbol']}</b>｜{t.get('signal_level')}",
+                    "方向：<b>買現貨 + 空合約</b>",
+                    f"當前費率：<b>{fmt_pct(t.get('current_funding_rate'))}</b>",
+                    f"7日平均：<b>{fmt_pct(t.get('avg_funding_rate_7d'))}</b>",
+                    f"毛年化：<b>{fmt_pct(t.get('gross_apy') or t.get('apy'), 2)}</b>",
+                    f"真實淨年化：<b>{fmt_pct(t.get('net_apy'), 2)}</b>",
+                    f"回本：<b>{safe_float(t.get('payback_days'), 999999):.2f} 天</b>",
+                    f"完整成本：<b>{fmt_pct(t.get('roundtrip_cost_rate'), 4)}</b>",
+                    f"每日 funding：<b>{fmt_pct(t.get('daily_funding_yield'), 4)}</b>",
+                    f"每日成本攤提：<b>{fmt_pct(t.get('daily_cost_drag'), 4)}</b>",
+                    f"Basis：<b>{fmt_pct(t.get('basis_rate'))}</b>",
+                    f"總滑點：<b>{fmt_pct(t.get('total_slippage'))}</b>",
+                    f"半自動：<code>/order {t['symbol']} {DEFAULT_ORDER_NOTIONAL_USDT}</code>",
+                    f"診斷：<code>/why {t['symbol']}</code>",
+                ])
 
-          lines.extend([
-              "",
-              f"🎯 目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>",
-              "⚠️ 僅供監控，不代表投資建議。實盤請先 DRY_RUN。",
-          ])
+        if send_watch:
+            lines.extend([
+                "",
+                "⚠️ <b>高風險觀察</b>",
+            ])
 
-          await self.tg.send("\n".join(lines))
+            for i, t in enumerate(send_watch, 1):
+                lines.extend([
+                    "",
+                    f"#{i} <b>{t['symbol']}</b>",
+                    f"當前費率：<b>{fmt_pct(t.get('current_funding_rate'))}</b>",
+                    f"原因：<code>{html.escape(str(t.get('fail_reason', '')))}</code>",
+                    f"診斷：<code>/why {t['symbol']}</code>",
+                ])
 
+        lines.extend([
+            "",
+            f"🎯 目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>",
+            "⚠️ 僅供監控，不代表投資建議。實盤請先 DRY_RUN。",
+        ])
 
-  # =========================
-  # Main
-  # =========================
-  async def main():
-      logger.info("Funding Radar V2 Net Profit starting")
-
-      db = RadarDB(DB_PATH)
-
-      timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
-      sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
-
-      async with aiohttp.ClientSession(timeout=timeout) as session:
-          http = Http(session, sem)
-          api = BinancePublic(http)
-          trader = Trader(http, db)
-          tg = Telegram(session, db, trader)
-          scanner = Scanner(db, api, tg)
-
-          await asyncio.gather(
-              scanner.loop(),
-              tg.poll_loop(),
-          )
+        await self.tg.send("\n".join(lines))
 
 
-  if __name__ == "__main__":
-      try:
-          asyncio.run(main())
-      except KeyboardInterrupt:
-          logger.info("Stopped")
+# =========================
+# Main
+# =========================
+async def main():
+    logger.info("Funding Radar V2 Net Profit starting")
+
+    db = RadarDB(DB_PATH)
+
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+    sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        http = Http(session, sem)
+        api = BinancePublic(http)
+        trader = Trader(http, db)
+        tg = Telegram(session, db, trader)
+        scanner = Scanner(db, api, tg)
+
+        await asyncio.gather(
+            scanner.loop(),
+            tg.poll_loop(),
+        )
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Stopped")
