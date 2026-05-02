@@ -81,7 +81,9 @@ RANK_SCAN_MIN_CURRENT_FUNDING_RATE = float(
 MAX_RANK_CANDIDATES = int(
     os.getenv("MAX_RANK_CANDIDATES", "80")
 )
-
+TOP_RANK_LIMIT = int(
+    os.getenv("TOP_RANK_LIMIT", "15")
+)
 HIGH_RISK_CURRENT_RATE_THRESHOLD = float(os.getenv("HIGH_RISK_CURRENT_RATE_THRESHOLD", "0.0005"))
 ENABLE_HIGH_RISK_WATCHLIST = os.getenv("ENABLE_HIGH_RISK_WATCHLIST", "true").lower() == "true"
 
@@ -1202,12 +1204,19 @@ class Telegram:
                 symbol = norm_symbol(parts[1])
                 reason = " ".join(parts[2:]) if len(parts) > 2 else "telegram"
                 self.db.add_blacklist(symbol, reason)
-                await self.send(f"🚫 <b>已加入黑名單</b>\n\n交易對：<b>{self.h(symbol)}</b>\n原因：<code>{self.h(reason)}</code>")
+                await self.send(
+                    f"🚫 <b>已加入黑名單</b>\n\n"
+                    f"交易對：<b>{self.h(symbol)}</b>\n"
+                    f"原因：<code>{self.h(reason)}</code>"
+                )
 
             elif cmd == "/blacklist_remove" and len(parts) >= 2:
                 symbol = norm_symbol(parts[1])
                 self.db.remove_blacklist(symbol)
-                await self.send(f"✅ <b>已移除黑名單</b>\n\n交易對：<b>{self.h(symbol)}</b>")
+                await self.send(
+                    f"✅ <b>已移除黑名單</b>\n\n"
+                    f"交易對：<b>{self.h(symbol)}</b>"
+                )
 
             elif cmd == "/order" and len(parts) >= 2:
                 symbol = norm_symbol(parts[1])
@@ -1223,10 +1232,16 @@ class Telegram:
                     "常用：\n"
                     "<code>/status</code>\n"
                     "<code>/top</code>\n"
+                    "<code>/rank</code>\n"
                     "<code>/topnet</code>\n"
                     "<code>/top16</code>\n"
                     "<code>/why ETHUSDT</code>"
                 )
+
+        except Exception as e:
+            logger.exception(f"Telegram command error: {e}")
+            await self.send(f"❌ <b>指令錯誤</b>\n\n<code>{self.h(e)}</code>")
+            
     async def cmd_rank(self):
         since_ts = now_ts() - 24 * 60 * 60
 
@@ -1267,7 +1282,6 @@ class Telegram:
             )
             return
 
-        # Python 端加入穩定度分數後再排序
         enriched = []
 
         for r in rows:
@@ -1332,10 +1346,6 @@ class Telegram:
         )
 
         await self.send("\n".join(lines))
-
-        except Exception as e:
-            logger.exception(f"Telegram command error: {e}")
-            await self.send(f"❌ <b>指令錯誤</b>\n\n<code>{self.h(e)}</code>")
 
     def help_text(self) -> str:
         return (
