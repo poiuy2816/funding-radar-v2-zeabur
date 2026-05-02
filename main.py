@@ -1054,6 +1054,7 @@ class Telegram:
             return f"淨年化尚未達標，還差 {abs(gap) * 100:.2f}%"
         except Exception:
             return "無法判斷"
+            
     def calc_stability_score_from_row(self, row: sqlite3.Row) -> Tuple[int, str]:
         """
         穩定度分數 0~100：
@@ -1651,9 +1652,9 @@ class Telegram:
         )
 
 
-# =========================
-# Scanner
-# =========================
+            # =========================
+            # Scanner
+            # =========================
 class Scanner:
     def __init__(self, db: RadarDB, api: BinancePublic, tg: Telegram):
         self.db = db
@@ -1715,14 +1716,14 @@ class Scanner:
 
             if mark_price <= 0:
                 continue
-# 排名模式：
-# 不再要求 current funding 一定要大於 0.02%
-# 只要是正 funding，就先納入排名候選
-# ALWAYS_TRACK_SYMBOLS 永遠追蹤
+            # 排名模式：
+            # 不再要求 current funding 一定要大於 0.02%
+            # 只要是正 funding，就先納入排名候選
+            # ALWAYS_TRACK_SYMBOLS 永遠追蹤
             if not force_track and current_rate <= RANK_SCAN_MIN_CURRENT_FUNDING_RATE:
                 continue
-# 一般標的仍要求成交量，避免掃到太冷門標的
-# 固定追蹤標的不受這個限制
+            # 一般標的仍要求成交量，避免掃到太冷門標的
+            # 固定追蹤標的不受這個限制
             if not force_track and quote_vol < MIN_24H_QUOTE_VOLUME_USDT:
                 continue
 
@@ -1738,9 +1739,9 @@ class Scanner:
             f"初步候選數量：{len(candidates)} | "
             f"固定追蹤：{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}"
         )
-# 避免一次掃太多幣造成 API 壓力：
-# 1. 固定追蹤標的一定保留
-# 2. 其他標的依 current funding 由高到低取前 MAX_RANK_CANDIDATES
+            # 避免一次掃太多幣造成 API 壓力：
+            # 1. 固定追蹤標的一定保留
+            # 2. 其他標的依 current funding 由高到低取前 MAX_RANK_CANDIDATES
         force_candidates = [
             x for x in candidates
             if x.get("force_track")
@@ -2047,7 +2048,8 @@ class Scanner:
                     f"診斷：<code>/why {t['symbol']}</code>",
                 ])
 
-        lines
+        await self.tg.send("\n".join(lines))
+
 # =========================
 # Main
 # =========================
