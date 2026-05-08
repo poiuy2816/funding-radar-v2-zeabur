@@ -70,10 +70,10 @@ ALWAYS_TRACK_SYMBOLS = {
     for x in os.getenv("ALWAYS_TRACK_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT").split(",")
     if x.strip()
 }
+
 # =========================
 # Ranking Mode
 # =========================
-# 排名模式不要求 16%，而是從最高真實淨年化往下排
 RANK_SCAN_MIN_CURRENT_FUNDING_RATE = float(
     os.getenv("RANK_SCAN_MIN_CURRENT_FUNDING_RATE", "0")
 )
@@ -81,9 +81,57 @@ RANK_SCAN_MIN_CURRENT_FUNDING_RATE = float(
 MAX_RANK_CANDIDATES = int(
     os.getenv("MAX_RANK_CANDIDATES", "80")
 )
+
 TOP_RANK_LIMIT = int(
     os.getenv("TOP_RANK_LIMIT", "15")
 )
+
+# =========================
+# OI Radar Mode
+# =========================
+OI_SCAN_TOP_LIMIT = int(os.getenv("OI_SCAN_TOP_LIMIT", "8"))
+OI_SCAN_UNIVERSE_LIMIT = int(os.getenv("OI_SCAN_UNIVERSE_LIMIT", "80"))
+
+OI_MIN_QUOTE_VOLUME_USDT = float(
+    os.getenv("OI_MIN_QUOTE_VOLUME_USDT", "30000000")
+)
+
+OI_MIN_OI_CHANGE_15M = float(
+    os.getenv("OI_MIN_OI_CHANGE_15M", "0.035")
+)
+
+OI_MIN_PRICE_CHANGE_15M = float(
+    os.getenv("OI_MIN_PRICE_CHANGE_15M", "0.006")
+)
+
+OI_MIN_VOLUME_RATIO = float(
+    os.getenv("OI_MIN_VOLUME_RATIO", "1.3")
+)
+
+OI_MAX_FUNDING_ABS = float(
+    os.getenv("OI_MAX_FUNDING_ABS", "0.0005")
+)
+
+OI_RSI_OVERBOUGHT = float(
+    os.getenv("OI_RSI_OVERBOUGHT", "75")
+)
+
+OI_RSI_OVERSOLD = float(
+    os.getenv("OI_RSI_OVERSOLD", "25")
+)
+
+OI_MIN_SCORE = int(
+    os.getenv("OI_MIN_SCORE", "65")
+)
+
+OI_KLINE_LIMIT = int(
+    os.getenv("OI_KLINE_LIMIT", "80")
+)
+
+OI_HIST_LIMIT = int(
+    os.getenv("OI_HIST_LIMIT", "4")
+)
+
 HIGH_RISK_CURRENT_RATE_THRESHOLD = float(os.getenv("HIGH_RISK_CURRENT_RATE_THRESHOLD", "0.0005"))
 ENABLE_HIGH_RISK_WATCHLIST = os.getenv("ENABLE_HIGH_RISK_WATCHLIST", "true").lower() == "true"
 
@@ -148,6 +196,17 @@ def fmt_pct(x: Optional[float], digits: int = 4) -> str:
         return "N/A"
     try:
         return f"{float(x) * 100:.{digits}f}%"
+    except Exception:
+        return "N/A"
+
+
+def fmt_signed_pct(x: Optional[float], digits: int = 2) -> str:
+    if x is None:
+        return "N/A"
+    try:
+        v = float(x) * 100
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.{digits}f}%"
     except Exception:
         return "N/A"
 
@@ -559,6 +618,7 @@ class Http:
 
                         logger.warning(f"GET {url} status={resp.status} body={text[:300]}")
                         await asyncio.sleep(i)
+
             except Exception as e:
                 logger.warning(f"GET error {url}: {e}")
                 await asyncio.sleep(i)
@@ -615,6 +675,28 @@ class BinancePublic:
 
     async def ticker_24h_all(self):
         return await self.http.get(BINANCE_FAPI_BASE_URL, "/fapi/v1/ticker/24hr")
+
+    async def futures_klines(self, symbol: str, interval: str = "15m", limit: int = 80):
+        return await self.http.get(
+            BINANCE_FAPI_BASE_URL,
+            "/fapi/v1/klines",
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit,
+            },
+        )
+
+    async def open_interest_hist(self, symbol: str, period: str = "15m", limit: int = 4):
+        return await self.http.get(
+            BINANCE_FAPI_BASE_URL,
+            "/futures/data/openInterestHist",
+            {
+                "symbol": symbol,
+                "period": period,
+                "limit": limit,
+            },
+        )
 
     async def open_interest(self, symbol: str):
         return await self.http.get(
@@ -927,13 +1009,295 @@ def classify(payback: float, net_apy: Optional[float]) -> str:
 
 
 # =========================
+# OI Radar Math
+# =========================
+def calc_rsi_from_closes(closes: List[float], period: int = 14) -> Optional[float]:
+    try:
+        if len(closes) < period + 2:
+            return None
+
+        s = pd.Series(closes, dtype="float64")
+        delta = s.diff()
+
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+
+        avg_gain = gain.rolling(period).mean()
+        avg_loss = loss.rolling(period).mean()
+
+        avg_loss = avg_loss.replace(0, pd.NA)
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        val = rsi.iloc[-1]
+        if pd.isna(val):
+            return None
+
+        return float(val)
+    except Exception:
+        return None
+
+
+def calc_ema(values: List[float], period: int = 20) -> Optional[float]:
+    try:
+        if len(values) < period:
+            return None
+
+        s = pd.Series(values, dtype="float64")
+        return float(s.ewm(span=period, adjust=False).mean().iloc[-1])
+    except Exception:
+        return None
+
+
+def calc_atr_from_klines(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    period: int = 14,
+) -> Optional[float]:
+    try:
+        if len(closes) < period + 2:
+            return None
+
+        trs = []
+
+        for i in range(1, len(closes)):
+            high = highs[i]
+            low = lows[i]
+            prev_close = closes[i - 1]
+
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
+            trs.append(tr)
+
+        if len(trs) < period:
+            return None
+
+        return float(pd.Series(trs, dtype="float64").rolling(period).mean().iloc[-1])
+    except Exception:
+        return None
+
+
+def parse_klines_for_oi(klines: List[List[Any]]) -> Optional[Dict[str, Any]]:
+    try:
+        if not klines or len(klines) < 30:
+            return None
+
+        opens = [float(x[1]) for x in klines]
+        highs = [float(x[2]) for x in klines]
+        lows = [float(x[3]) for x in klines]
+        closes = [float(x[4]) for x in klines]
+        volumes = [float(x[5]) for x in klines]
+
+        last_open = opens[-1]
+        last_close = closes[-1]
+
+        if last_open <= 0 or last_close <= 0:
+            return None
+
+        price_change_15m = last_close / last_open - 1
+
+        prev_volumes = volumes[-21:-1]
+        avg_prev_volume = sum(prev_volumes) / len(prev_volumes) if prev_volumes else 0
+
+        if avg_prev_volume <= 0:
+            volume_ratio = 0.0
+        else:
+            volume_ratio = volumes[-1] / avg_prev_volume
+
+        rsi = calc_rsi_from_closes(closes, 14)
+        ema20 = calc_ema(closes, 20)
+        ema50 = calc_ema(closes, 50)
+        atr = calc_atr_from_klines(highs, lows, closes, 14)
+
+        return {
+            "price": last_close,
+            "price_change_15m": price_change_15m,
+            "volume_ratio": volume_ratio,
+            "rsi": rsi,
+            "ema20": ema20,
+            "ema50": ema50,
+            "atr": atr,
+            "last_volume": volumes[-1],
+        }
+    except Exception:
+        return None
+
+
+def calc_oi_change_from_hist(hist: List[Dict[str, Any]]) -> Optional[float]:
+    try:
+        if not hist or len(hist) < 2:
+            return None
+
+        values = []
+
+        for x in hist:
+            v = x.get("sumOpenInterestValue")
+
+            if v is None:
+                v = x.get("sumOpenInterest")
+
+            v = safe_float(v, 0.0)
+
+            if v > 0:
+                values.append(v)
+
+        if len(values) < 2:
+            return None
+
+        first = values[0]
+        last = values[-1]
+
+        if first <= 0:
+            return None
+
+        return last / first - 1
+    except Exception:
+        return None
+
+
+def oi_signal_score(
+    oi_change: float,
+    price_change: float,
+    volume_ratio: float,
+    rsi: Optional[float],
+    funding: float,
+    quote_volume: float,
+    direction: str,
+) -> Tuple[int, str]:
+    score = 0.0
+    notes = []
+
+    oi_abs = max(0.0, oi_change)
+    price_abs = abs(price_change)
+
+    oi_score = min(30.0, oi_abs / max(OI_MIN_OI_CHANGE_15M, 0.0001) * 20.0)
+    price_score = min(20.0, price_abs / max(OI_MIN_PRICE_CHANGE_15M, 0.0001) * 12.0)
+    volume_score = min(20.0, volume_ratio / max(OI_MIN_VOLUME_RATIO, 0.1) * 12.0)
+
+    score += oi_score
+    score += price_score
+    score += volume_score
+
+    if rsi is None:
+        rsi_score = 8.0
+        notes.append("RSI 資料不足")
+    else:
+        if direction == "LONG":
+            if rsi >= OI_RSI_OVERBOUGHT:
+                rsi_score = 5.0
+                notes.append("RSI 偏過熱")
+            elif rsi >= 45:
+                rsi_score = 15.0
+            else:
+                rsi_score = 9.0
+                notes.append("RSI 尚未轉強")
+        else:
+            if rsi <= OI_RSI_OVERSOLD:
+                rsi_score = 5.0
+                notes.append("RSI 偏過冷")
+            elif rsi <= 55:
+                rsi_score = 15.0
+            else:
+                rsi_score = 9.0
+                notes.append("RSI 尚未轉弱")
+
+    score += rsi_score
+
+    funding_abs = abs(safe_float(funding, 0.0))
+
+    if funding_abs <= OI_MAX_FUNDING_ABS:
+        funding_score = 10.0
+    else:
+        funding_score = max(
+            0.0,
+            10.0 - (funding_abs / max(OI_MAX_FUNDING_ABS, 0.0001) - 1.0) * 5.0,
+        )
+        notes.append("Funding 偏極端")
+
+    score += funding_score
+
+    liquidity_score = min(5.0, quote_volume / 100_000_000 * 5.0)
+    score += liquidity_score
+
+    score_int = int(max(0, min(100, round(score))))
+
+    if score_int >= 85:
+        label = "🔥 強訊號"
+    elif score_int >= 75:
+        label = "✅ 值得觀察"
+    elif score_int >= 65:
+        label = "🟡 普通觀察"
+    else:
+        label = "⚪ 弱訊號"
+
+    if notes:
+        label += "｜" + "、".join(notes[:2])
+
+    return score_int, label
+
+
+def build_oi_levels(price: float, atr: Optional[float], direction: str) -> Dict[str, Optional[float]]:
+    try:
+        price = float(price)
+
+        if price <= 0:
+            return {
+                "zone_low": None,
+                "zone_high": None,
+                "sl": None,
+                "tp1": None,
+                "tp2": None,
+            }
+
+        if atr is None or atr <= 0:
+            atr = price * 0.01
+
+        if direction == "LONG":
+            return {
+                "zone_low": price - atr * 0.20,
+                "zone_high": price + atr * 0.10,
+                "sl": price - atr * 1.50,
+                "tp1": price + atr * 1.80,
+                "tp2": price + atr * 3.00,
+            }
+
+        return {
+            "zone_low": price - atr * 0.10,
+            "zone_high": price + atr * 0.20,
+            "sl": price + atr * 1.50,
+            "tp1": price - atr * 1.80,
+            "tp2": price - atr * 3.00,
+        }
+
+    except Exception:
+        return {
+            "zone_low": None,
+            "zone_high": None,
+            "sl": None,
+            "tp1": None,
+            "tp2": None,
+        }
+
+
+# =========================
 # Telegram
 # =========================
 class Telegram:
-    def __init__(self, session: aiohttp.ClientSession, db: RadarDB, trader: Trader):
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        db: RadarDB,
+        trader: Trader,
+        api: Optional[BinancePublic] = None,
+    ):
         self.session = session
         self.db = db
         self.trader = trader
+        self.api = api
         self.offset = 0
 
     async def send(self, text: str) -> bool:
@@ -941,6 +1305,42 @@ class Telegram:
             logger.warning("Telegram env 未設定，略過發送")
             return False
 
+        max_len = 3500
+
+        if len(text) <= max_len:
+            return await self._send_one(text)
+
+        chunks = []
+        current = ""
+
+        for line in text.split("\n"):
+            candidate = current + line + "\n"
+
+            if len(candidate) > max_len:
+                if current.strip():
+                    chunks.append(current.strip())
+                current = line + "\n"
+            else:
+                current = candidate
+
+        if current.strip():
+            chunks.append(current.strip())
+
+        ok = True
+        total = len(chunks)
+
+        for i, chunk in enumerate(chunks, 1):
+            prefix = f"📨 <b>訊息 {i}/{total}</b>\n\n" if total > 1 else ""
+            sent = await self._send_one(prefix + chunk)
+
+            if not sent:
+                ok = False
+
+            await asyncio.sleep(0.3)
+
+        return ok
+
+    async def _send_one(self, text: str) -> bool:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
         payload = {
@@ -959,6 +1359,7 @@ class Telegram:
 
                 logger.error(f"Telegram send failed: {body}")
                 return False
+
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
             return False
@@ -1047,16 +1448,8 @@ class Telegram:
             return f"淨年化尚未達標，還差 {abs(gap) * 100:.2f}%"
         except Exception:
             return "無法判斷"
-            
+
     def calc_stability_score_from_row(self, row: sqlite3.Row) -> Tuple[int, str]:
-        """
-        穩定度分數 0~100：
-        - 正費率比例越高越好
-        - 標準差 / 平均越低越好
-        - 近期 funding 沒有明顯衰退越好
-        - 當前 funding 沒有低於 7 日平均太多越好
-        - 回本天數越短越好
-        """
         avg_rate = safe_float(self.row_get(row, "avg_funding_rate_7d"), 0.0)
         std_rate = safe_float(self.row_get(row, "std_funding_rate_7d"), 0.0)
         pos_ratio = self.row_get(row, "positive_ratio_7d")
@@ -1074,29 +1467,23 @@ class Telegram:
 
         score = 100.0
 
-        # 正費率比例不足扣分，最多扣 35
         if pos_ratio < 0.8:
             score -= min(35.0, (0.8 - pos_ratio) / 0.8 * 35.0)
 
-        # 平均 funding <= 0，代表不適合正向套利
         if avg_rate <= 0:
             score -= 30.0
         else:
             std_to_avg = std_rate / avg_rate
 
-            # 波動相對平均過大扣分，最多扣 25
             if std_to_avg > 1.0:
                 score -= min(25.0, (std_to_avg - 1.0) * 12.5)
 
-            # 近期 funding 衰退扣分
             if recent_avg < avg_rate * RECENT_AVG_MIN_RATIO_TO_7D:
                 score -= 15.0
 
-            # 當前 funding 低於 7 日平均太多扣分
             if current_rate < avg_rate * CURRENT_MIN_RATIO_TO_7D:
                 score -= 15.0
 
-        # 回本天數太長扣分
         if payback_days > MAX_PAYBACK_DAYS:
             score -= min(15.0, (payback_days - MAX_PAYBACK_DAYS) * 1.5)
 
@@ -1179,17 +1566,14 @@ class Telegram:
                 self.db.set_setting("scanner_paused", "false")
                 await self.send("▶️ <b>已恢復掃描</b>")
 
-            elif cmd == "/top":
-                await self.cmd_rank()
-
-            elif cmd == "/rank":
-                await self.cmd_rank()
-
-            elif cmd == "/topnet":
+            elif cmd in ["/top", "/rank", "/topnet"]:
                 await self.cmd_rank()
 
             elif cmd == "/top16":
                 await self.cmd_top16()
+
+            elif cmd == "/oi":
+                await self.cmd_oi()
 
             elif cmd == "/why" and len(parts) >= 2:
                 await self.cmd_why(norm_symbol(parts[1]))
@@ -1229,13 +1613,253 @@ class Telegram:
                     "<code>/rank</code>\n"
                     "<code>/topnet</code>\n"
                     "<code>/top16</code>\n"
+                    "<code>/oi</code>\n"
                     "<code>/why ETHUSDT</code>"
                 )
 
         except Exception as e:
             logger.exception(f"Telegram command error: {e}")
             await self.send(f"❌ <b>指令錯誤</b>\n\n<code>{self.h(e)}</code>")
-            
+
+    async def cmd_oi(self):
+        if self.api is None:
+            await self.send("❌ OI 雷達尚未掛載 Binance API。")
+            return
+
+        await self.send("⏳ <b>OI 持倉異常雷達掃描中...</b>\n\n請稍候 10～30 秒。")
+
+        try:
+            f_info, ticker_all, premium_all = await asyncio.gather(
+                self.api.futures_exchange_info(),
+                self.api.ticker_24h_all(),
+                self.api.premium_all(),
+            )
+
+            futures_symbols = parse_futures_symbols(f_info)
+            blacklist = self.db.blacklist()
+
+            premium_map = {
+                x.get("symbol"): x
+                for x in premium_all
+                if x.get("symbol")
+            }
+
+            candidates = []
+
+            for t in ticker_all:
+                symbol = t.get("symbol")
+
+                if not symbol:
+                    continue
+
+                if symbol not in futures_symbols:
+                    continue
+
+                if symbol in blacklist:
+                    continue
+
+                try:
+                    quote_volume = float(t.get("quoteVolume", 0))
+                    last_price = float(t.get("lastPrice", 0))
+                except Exception:
+                    continue
+
+                if quote_volume < OI_MIN_QUOTE_VOLUME_USDT:
+                    continue
+
+                if last_price <= 0:
+                    continue
+
+                candidates.append({
+                    "symbol": symbol,
+                    "quote_volume": quote_volume,
+                    "last_price": last_price,
+                })
+
+            candidates.sort(
+                key=lambda x: x.get("quote_volume", 0),
+                reverse=True,
+            )
+
+            candidates = candidates[:OI_SCAN_UNIVERSE_LIMIT]
+
+            async def analyze_oi_candidate(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                symbol = c["symbol"]
+
+                try:
+                    oi_hist, klines = await asyncio.gather(
+                        self.api.open_interest_hist(
+                            symbol,
+                            period="15m",
+                            limit=OI_HIST_LIMIT,
+                        ),
+                        self.api.futures_klines(
+                            symbol,
+                            interval="15m",
+                            limit=OI_KLINE_LIMIT,
+                        ),
+                    )
+
+                    oi_change = calc_oi_change_from_hist(oi_hist)
+                    k = parse_klines_for_oi(klines)
+
+                    if oi_change is None or k is None:
+                        return None
+
+                    price_change = safe_float(k.get("price_change_15m"), 0.0)
+                    volume_ratio = safe_float(k.get("volume_ratio"), 0.0)
+                    price = safe_float(k.get("price"), 0.0)
+                    rsi = k.get("rsi")
+                    atr = k.get("atr")
+
+                    if oi_change < OI_MIN_OI_CHANGE_15M:
+                        return None
+
+                    if abs(price_change) < OI_MIN_PRICE_CHANGE_15M:
+                        return None
+
+                    if volume_ratio < OI_MIN_VOLUME_RATIO:
+                        return None
+
+                    if price_change > 0:
+                        direction = "LONG"
+                        direction_text = "偏多觀察"
+                        story = "價格上漲且 OI 同步增加，疑似新多單進場推動。"
+                    else:
+                        direction = "SHORT"
+                        direction_text = "偏空觀察"
+                        story = "價格下跌但 OI 同步增加，疑似新空單進場壓制。"
+
+                    premium = premium_map.get(symbol, {})
+                    funding = safe_float(premium.get("lastFundingRate"), 0.0)
+
+                    score, label = oi_signal_score(
+                        oi_change=oi_change,
+                        price_change=price_change,
+                        volume_ratio=volume_ratio,
+                        rsi=rsi,
+                        funding=funding,
+                        quote_volume=c["quote_volume"],
+                        direction=direction,
+                    )
+
+                    if score < OI_MIN_SCORE:
+                        return None
+
+                    levels = build_oi_levels(price, atr, direction)
+
+                    return {
+                        "symbol": symbol,
+                        "direction": direction,
+                        "direction_text": direction_text,
+                        "story": story,
+                        "score": score,
+                        "label": label,
+                        "price": price,
+                        "price_change_15m": price_change,
+                        "oi_change_15m": oi_change,
+                        "volume_ratio": volume_ratio,
+                        "rsi": rsi,
+                        "atr": atr,
+                        "funding": funding,
+                        "quote_volume": c["quote_volume"],
+                        "levels": levels,
+                    }
+
+                except Exception as e:
+                    logger.warning(f"OI analyze failed {symbol}: {e}")
+                    return None
+
+            results = await asyncio.gather(
+                *[analyze_oi_candidate(c) for c in candidates],
+                return_exceptions=True,
+            )
+
+            signals = []
+
+            for r in results:
+                if isinstance(r, dict):
+                    signals.append(r)
+
+            signals.sort(
+                key=lambda x: (
+                    x.get("score", 0),
+                    abs(x.get("oi_change_15m", 0)),
+                    x.get("quote_volume", 0),
+                ),
+                reverse=True,
+            )
+
+            signals = signals[:OI_SCAN_TOP_LIMIT]
+
+            if not signals:
+                await self.send(
+                    "🎯 <b>OI 持倉異常狙擊鏡</b>\n\n"
+                    "目前沒有符合條件的 OI 異常標的。\n\n"
+                    "目前條件：\n"
+                    f"15m OI 增加 ≥ <b>{OI_MIN_OI_CHANGE_15M * 100:.2f}%</b>\n"
+                    f"15m 價格變化 ≥ <b>{OI_MIN_PRICE_CHANGE_15M * 100:.2f}%</b>\n"
+                    f"成交量放大 ≥ <b>{OI_MIN_VOLUME_RATIO:.2f}x</b>\n"
+                    f"最低 24H 成交額：<b>{self.fmt_money(OI_MIN_QUOTE_VOLUME_USDT)}</b>\n\n"
+                    "這不一定是壞事，代表目前沒有明顯短線槓桿異動。"
+                )
+                return
+
+            lines = [
+                "🎯 <b>持倉異常狙擊鏡｜Binance OI 雷達</b>",
+                f"時間：<code>{utc_text()}</code>",
+                "<code>模式：15m OI + 價格 + 成交量 + RSI + Funding</code>",
+                "",
+                "📌 判斷邏輯：",
+                "1. OI 增加代表新槓桿部位進場",
+                "2. 價格同步移動代表方向被推動",
+                "3. 成交量放大代表不是冷盤假訊號",
+                "4. 此為觀察雷達，不是直接喊單",
+                "",
+            ]
+
+            for i, s in enumerate(signals, 1):
+                symbol = s["symbol"]
+                levels = s.get("levels", {})
+
+                rsi_text = "N/A"
+                if s.get("rsi") is not None:
+                    rsi_text = f"{float(s.get('rsi')):.1f}"
+
+                atr_text = "N/A"
+                if s.get("atr") is not None:
+                    atr_text = self.fmt_price(s.get("atr"))
+
+                lines.append(
+                    f"#{i} <b>{self.h(symbol)}</b>｜<b>{self.h(s['direction_text'])}</b>\n"
+                    f"分數：<b>{s['score']}/100</b>｜{self.h(s['label'])}\n"
+                    f"現價：<code>{self.fmt_price(s.get('price'))}</code>\n"
+                    f"15m 價格：<b>{fmt_signed_pct(s.get('price_change_15m'))}</b>\n"
+                    f"15m OI：<b>{fmt_signed_pct(s.get('oi_change_15m'))}</b>\n"
+                    f"成交量放大：<b>{safe_float(s.get('volume_ratio'), 0):.2f}x</b>\n"
+                    f"Funding：<b>{fmt_pct(s.get('funding'))}</b>\n"
+                    f"RSI：<code>{rsi_text}</code>｜ATR：<code>{atr_text}</code>\n"
+                    f"24H 成交額：<code>{self.fmt_money(s.get('quote_volume'))}</code>\n"
+                    f"解讀：{self.h(s.get('story'))}\n"
+                    f"觀察區：<code>{self.fmt_price(levels.get('zone_low'))} ~ {self.fmt_price(levels.get('zone_high'))}</code>\n"
+                    f"防守參考：<code>{self.fmt_price(levels.get('sl'))}</code>\n"
+                    f"目標參考：<code>{self.fmt_price(levels.get('tp1'))} / {self.fmt_price(levels.get('tp2'))}</code>\n"
+                )
+
+            lines.append(
+                "⚠️ <b>提醒</b>：OI 增加只代表新槓桿進場，不保證方向延續。"
+                "若價格已遠離觀察區，寧可放棄，不要追價。"
+            )
+
+            await self.send("\n".join(lines))
+
+        except Exception as e:
+            logger.exception(f"cmd_oi error: {e}")
+            await self.send(
+                "❌ <b>OI 雷達掃描失敗</b>\n\n"
+                f"<code>{self.h(e)}</code>"
+            )
+
     async def cmd_rank(self):
         since_ts = now_ts() - 24 * 60 * 60
 
@@ -1349,6 +1973,7 @@ class Telegram:
             "/top - 排名模式，依真實淨年化由高到低\n"
             "/topnet - 同 /top\n"
             "/top16 - 查看毛年化達標標的\n"
+            "/oi - OI 持倉異常狙擊鏡\n"
             "/why SYMBOL - 查看單一交易對診斷\n\n"
             "⏸ <b>控制</b>\n"
             "/pause - 暫停掃描\n"
@@ -1363,7 +1988,13 @@ class Telegram:
             f"💰 目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>\n"
             f"⏳ 預估持倉天數：<b>{EXPECTED_HOLD_DAYS:.0f} 天</b>\n"
             f"🔁 計入出場成本：<b>{INCLUDE_EXIT_COST}</b>\n"
-            f"📌 固定追蹤：<code>{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}</code>"
+            f"📌 固定追蹤：<code>{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}</code>\n\n"
+            "🎯 <b>OI 雷達參數</b>\n"
+            f"顯示數量：<b>{OI_SCAN_TOP_LIMIT}</b>\n"
+            f"掃描池：<b>{OI_SCAN_UNIVERSE_LIMIT}</b>\n"
+            f"最低 OI 變化：<b>{OI_MIN_OI_CHANGE_15M * 100:.2f}%</b>\n"
+            f"最低價格變化：<b>{OI_MIN_PRICE_CHANGE_15M * 100:.2f}%</b>\n"
+            f"最低成交量放大：<b>{OI_MIN_VOLUME_RATIO:.2f}x</b>"
         )
 
     async def cmd_status(self):
@@ -1409,71 +2040,14 @@ class Telegram:
             f"歷史 PASS：<b>{pass_count}</b>\n"
             f"歷史 WATCH：<b>{watch_count}</b>\n"
             f"真實淨利達標 PASS：<b>{net_pass_count}</b>\n"
-            f"最後更新：<code>{self.fmt_time(latest_ts)}</code>"
+            f"最後更新：<code>{self.fmt_time(latest_ts)}</code>\n\n"
+            "🎯 <b>OI 雷達</b>\n"
+            f"掃描池：<b>{OI_SCAN_UNIVERSE_LIMIT}</b>\n"
+            f"顯示數量：<b>{OI_SCAN_TOP_LIMIT}</b>\n"
+            f"最低 OI 變化：<b>{OI_MIN_OI_CHANGE_15M * 100:.2f}%</b>\n"
+            f"最低價格變化：<b>{OI_MIN_PRICE_CHANGE_15M * 100:.2f}%</b>\n"
+            f"最低成交量放大：<b>{OI_MIN_VOLUME_RATIO:.2f}x</b>"
         )
-
-    async def cmd_top(self):
-        since_ts = now_ts() - 24 * 60 * 60
-
-        with self.db.conn() as con:
-            con.row_factory = sqlite3.Row
-            rows = con.execute("""
-            WITH ranked AS (
-                SELECT
-                    *,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY symbol
-                        ORDER BY ts DESC, id DESC
-                    ) AS rn
-                FROM scan_results
-                WHERE ts >= ?
-            )
-            SELECT *
-            FROM ranked
-            WHERE rn = 1
-              AND UPPER(status) = 'PASS'
-              AND COALESCE(arb_direction, 'FORWARD') = 'FORWARD'
-              AND net_apy IS NOT NULL
-              AND net_apy >= ?
-            ORDER BY
-                COALESCE(net_apy, 0) DESC,
-                COALESCE(payback_days, 999999) ASC
-            LIMIT 10
-            """, (since_ts, TARGET_NET_APY)).fetchall()
-
-        if not rows:
-            await self.send(
-                "目前沒有真實淨利通過訊號。\n\n"
-                "你可以使用：\n"
-                "<code>/top16</code>\n"
-                "<code>/why ETHUSDT</code>"
-            )
-            return
-
-        lines = [
-            "🏆 <b>最新真實淨利通過訊號</b>",
-            "<code>正向套利：買現貨 + 空合約｜最近 24 小時</code>",
-            f"目標真實淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>",
-        ]
-
-        for i, r in enumerate(rows, 1):
-            symbol = self.row_get(r, "symbol", "")
-            lines.append(
-                f"\n#{i} <b>{self.h(symbol)}</b>｜{self.h(self.row_get(r, 'signal_level', ''))}\n"
-                f"時間：<code>{self.fmt_time(self.row_get(r, 'ts'))}</code>\n"
-                f"當前資金費率：{fmt_pct(self.row_get(r, 'current_funding_rate'))}\n"
-                f"7日平均資金費率：{fmt_pct(self.row_get(r, 'avg_funding_rate_7d'))}\n"
-                f"毛年化：<b>{fmt_pct(self.row_get(r, 'gross_apy') or self.row_get(r, 'apy'), 2)}</b>\n"
-                f"真實淨年化：<b>{fmt_pct(self.row_get(r, 'net_apy'), 2)}</b>\n"
-                f"回本天數：{self.fmt_days(self.row_get(r, 'payback_days'))}\n"
-                f"完整進出場成本：{fmt_pct(self.row_get(r, 'roundtrip_cost_rate'), 4)}\n"
-                f"總滑點：{fmt_pct(self.row_get(r, 'total_slippage'))}\n"
-                f"24H 成交額：<code>{self.fmt_money(self.row_get(r, 'quote_volume'))}</code>\n"
-                f"OI 名目價值：<code>{self.fmt_money(self.row_get(r, 'open_interest_notional'))}</code>\n"
-                f"診斷：<code>/why {self.h(symbol)}</code>"
-            )
-
-        await self.send("\n".join(lines))
 
     async def cmd_top16(self):
         since_ts = now_ts() - 24 * 60 * 60
@@ -1645,9 +2219,9 @@ class Telegram:
         )
 
 
-            # =========================
-            # Scanner
-            # =========================
+# =========================
+# Scanner
+# =========================
 class Scanner:
     def __init__(self, db: RadarDB, api: BinancePublic, tg: Telegram):
         self.db = db
@@ -1709,14 +2283,10 @@ class Scanner:
 
             if mark_price <= 0:
                 continue
-            # 排名模式：
-            # 不再要求 current funding 一定要大於 0.02%
-            # 只要是正 funding，就先納入排名候選
-            # ALWAYS_TRACK_SYMBOLS 永遠追蹤
+
             if not force_track and current_rate <= RANK_SCAN_MIN_CURRENT_FUNDING_RATE:
                 continue
-            # 一般標的仍要求成交量，避免掃到太冷門標的
-            # 固定追蹤標的不受這個限制
+
             if not force_track and quote_vol < MIN_24H_QUOTE_VOLUME_USDT:
                 continue
 
@@ -1732,13 +2302,12 @@ class Scanner:
             f"初步候選數量：{len(candidates)} | "
             f"固定追蹤：{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}"
         )
-            # 避免一次掃太多幣造成 API 壓力：
-            # 1. 固定追蹤標的一定保留
-            # 2. 其他標的依 current funding 由高到低取前 MAX_RANK_CANDIDATES
+
         force_candidates = [
             x for x in candidates
             if x.get("force_track")
         ]
+
         normal_candidates = [
             x for x in candidates
             if not x.get("force_track")
@@ -1748,15 +2317,19 @@ class Scanner:
             key=lambda x: x.get("current_funding_rate") or 0,
             reverse=True,
         )
+
         candidates = force_candidates + normal_candidates[:MAX_RANK_CANDIDATES]
+
         logger.info(
             f"實際分析數量：{len(candidates)} | "
             f"一般候選上限：{MAX_RANK_CANDIDATES}"
         )
+
         results = await asyncio.gather(
             *[self.analyze(c) for c in candidates],
             return_exceptions=True,
         )
+
         passed = []
         watched = []
 
@@ -2043,11 +2616,12 @@ class Scanner:
 
         await self.tg.send("\n".join(lines))
 
+
 # =========================
 # Main
 # =========================
 async def main():
-    logger.info("Funding Radar V2 Net Profit starting")
+    logger.info("Funding Radar V2 Net Profit + OI Radar starting")
 
     db = RadarDB(DB_PATH)
 
@@ -2058,14 +2632,14 @@ async def main():
         http = Http(session, sem)
         api = BinancePublic(http)
         trader = Trader(http, db)
-        tg = Telegram(session, db, trader)
+        tg = Telegram(session, db, trader, api)
         scanner = Scanner(db, api, tg)
 
         await tg.send(
             "✅ <b>Funding Radar 已啟動</b>\n\n"
             f"時間：<code>{utc_text()}</code>\n"
             f"固定追蹤：<code>{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}</code>\n"
-            "你可以輸入：<code>/status</code>"
+            "你可以輸入：<code>/status</code> 或 <code>/oi</code>"
         )
 
         await asyncio.gather(
