@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY main.py /app/main.py
+COPY oi_tracker.py /app/oi_tracker.py
 COPY ui.py /app/ui.py
 COPY start.sh /app/start.sh
 
