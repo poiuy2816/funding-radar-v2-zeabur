@@ -1,3 +1,11 @@
+from oi_tracker import (
+    init_oi_tracker_db,
+    oi_tracker_loop,
+    record_oi_signal,
+    format_oi_log,
+    format_oi_stats,
+)
+
 import os
 import json
 import time
@@ -1575,8 +1583,16 @@ class Telegram:
             elif cmd == "/oi":
                 await self.cmd_oi()
 
+            elif cmd == "/oi_log":
+                await self.cmd_oi_log()
+
+            elif cmd == "/oi_stats":
+                symbol = norm_symbol(parts[1]) if len(parts) >= 2 else None
+                await self.cmd_oi_stats(symbol)
+
             elif cmd == "/why" and len(parts) >= 2:
                 await self.cmd_why(norm_symbol(parts[1]))
+
 
             elif cmd == "/blacklist_add" and len(parts) >= 2:
                 symbol = norm_symbol(parts[1])
@@ -1614,12 +1630,37 @@ class Telegram:
                     "<code>/topnet</code>\n"
                     "<code>/top16</code>\n"
                     "<code>/oi</code>\n"
+                    "<code>/oi_log</code>\n"
+                    "<code>/oi_stats</code>\n"
+                    "<code>/oi_stats FILUSDT</code>\n"
                     "<code>/why ETHUSDT</code>"
                 )
 
         except Exception as e:
             logger.exception(f"Telegram command error: {e}")
             await self.send(f"❌ <b>指令錯誤</b>\n\n<code>{self.h(e)}</code>")
+            
+    async def cmd_oi_log(self):
+        try:
+            text = format_oi_log(limit=10)
+            await self.send(text)
+        except Exception as e:
+            logger.exception(f"cmd_oi_log error: {e}")
+            await self.send(
+                "❌ <b>OI 訊號紀錄查詢失敗</b>\n\n"
+                f"<code>{self.h(e)}</code>"
+            )
+
+    async def cmd_oi_stats(self, symbol: Optional[str] = None):
+        try:
+            text = format_oi_stats(symbol=symbol)
+            await self.send(text)
+        except Exception as e:
+            logger.exception(f"cmd_oi_stats error: {e}")
+            await self.send(
+                "❌ <b>OI 訊號統計查詢失敗</b>\n\n"
+                f"<code>{self.h(e)}</code>"
+            )
 
     async def cmd_oi(self):
         if self.api is None:
@@ -1791,6 +1832,46 @@ class Telegram:
             )
 
             signals = signals[:OI_SCAN_TOP_LIMIT]
+            
+            # =========================
+            # OI Signal Tracker：自動紀錄訊號
+            # =========================
+            recorded_count = 0
+            skipped_count = 0
+
+            for s in signals:
+                levels = s.get("levels", {})
+
+                ok, reason = record_oi_signal({
+                    "symbol": s.get("symbol"),
+                    "direction": s.get("direction"),
+                    "score": s.get("score"),
+                    "label": s.get("label"),
+                    "entry_price": s.get("price"),
+                    "price_change_15m": s.get("price_change_15m"),
+                    "oi_change_15m": s.get("oi_change_15m"),
+                    "volume_ratio": s.get("volume_ratio"),
+                    "rsi": s.get("rsi"),
+                    "atr": s.get("atr"),
+                    "funding": s.get("funding"),
+                    "quote_volume": s.get("quote_volume"),
+                    "zone_low": levels.get("zone_low"),
+                    "zone_high": levels.get("zone_high"),
+                    "stop_price": levels.get("sl"),
+                    "tp1": levels.get("tp1"),
+                    "tp2": levels.get("tp2"),
+                })
+
+                if ok:
+                    recorded_count += 1
+                else:
+                    skipped_count += 1
+
+                logger.info(
+                    f"[OI Tracker] {s.get('symbol')} {s.get('direction')} "
+                    f"record={ok} reason={reason}"
+                )
+
 
             if not signals:
                 await self.send(
@@ -1850,6 +1931,14 @@ class Telegram:
                 "⚠️ <b>提醒</b>：OI 增加只代表新槓桿進場，不保證方向延續。"
                 "若價格已遠離觀察區，寧可放棄，不要追價。"
             )
+
+            lines.append("")
+            lines.append(
+                f"📒 <b>追蹤紀錄</b>：本次新增 <b>{recorded_count}</b> 筆，"
+                f"略過重複 <b>{skipped_count}</b> 筆。"
+            )
+            lines.append("查詢：<code>/oi_log</code>｜統計：<code>/oi_stats</code>")
+
 
             await self.send("\n".join(lines))
 
@@ -1974,6 +2063,9 @@ class Telegram:
             "/topnet - 同 /top\n"
             "/top16 - 查看毛年化達標標的\n"
             "/oi - OI 持倉異常狙擊鏡\n"
+            "/oi_log - 查看最近 OI 訊號追蹤紀錄\n"
+            "/oi_stats - 查看 OI 訊號統計\n"
+            "/oi_stats SYMBOL - 查看單一交易對 OI 統計\n"
             "/why SYMBOL - 查看單一交易對診斷\n\n"
             "⏸ <b>控制</b>\n"
             "/pause - 暫停掃描\n"
@@ -2024,6 +2116,17 @@ class Telegram:
               AND net_apy IS NOT NULL
               AND net_apy >= ?
             """, (TARGET_NET_APY,)).fetchone()[0]
+            try:
+                oi_signal_count = con.execute("SELECT COUNT(*) FROM oi_signals").fetchone()[0]
+                oi_tracking_count = con.execute("""
+                    SELECT COUNT(*)
+                    FROM oi_signals
+                    WHERE status='TRACKING'
+                """).fetchone()[0]
+            except Exception:
+                oi_signal_count = 0
+                oi_tracking_count = 0
+
 
         await self.send(
             "📡 <b>Funding Radar 系統狀態</b>\n\n"
@@ -2047,6 +2150,9 @@ class Telegram:
             f"最低 OI 變化：<b>{OI_MIN_OI_CHANGE_15M * 100:.2f}%</b>\n"
             f"最低價格變化：<b>{OI_MIN_PRICE_CHANGE_15M * 100:.2f}%</b>\n"
             f"最低成交量放大：<b>{OI_MIN_VOLUME_RATIO:.2f}x</b>"
+            f"累積訊號：<b>{oi_signal_count}</b>\n"
+            f"追蹤中：<b>{oi_tracking_count}</b>\n"
+            "查詢：<code>/oi_log</code>｜統計：<code>/oi_stats</code>"
         )
 
     async def cmd_top16(self):
@@ -2621,9 +2727,10 @@ class Scanner:
 # Main
 # =========================
 async def main():
-    logger.info("Funding Radar V2 Net Profit + OI Radar starting")
+    logger.info("Funding Radar V2 Net Profit + OI Radar + OI Tracker starting")
 
     db = RadarDB(DB_PATH)
+    init_oi_tracker_db()
 
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
     sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
@@ -2639,12 +2746,14 @@ async def main():
             "✅ <b>Funding Radar 已啟動</b>\n\n"
             f"時間：<code>{utc_text()}</code>\n"
             f"固定追蹤：<code>{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}</code>\n"
-            "你可以輸入：<code>/status</code> 或 <code>/oi</code>"
+            "功能：<code>Funding Radar + OI Radar + OI Signal Tracker</code>\n\n"
+            "你可以輸入：<code>/status</code>、<code>/oi</code>、<code>/oi_log</code> 或 <code>/oi_stats</code>"
         )
-
+        
         await asyncio.gather(
             scanner.loop(),
             tg.poll_loop(),
+            oi_tracker_loop(),
         )
 
 
