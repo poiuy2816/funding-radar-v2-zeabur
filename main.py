@@ -2924,6 +2924,30 @@ async def main():
     db = RadarDB(DB_PATH)
     init_oi_tracker_db()
 
+    try:
+        import sqlite3
+
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+
+            tables = cur.execute("""
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                ORDER BY name
+            """).fetchall()
+
+            logger.info(f"DB tables = {[x[0] for x in tables]}")
+
+            try:
+                row = cur.execute("SELECT COUNT(*) FROM oi_signals").fetchone()
+                logger.info(f"oi_signals count = {row[0]}")
+            except Exception as e:
+                logger.warning(f"count oi_signals failed: {e}")
+
+    except Exception as e:
+        logger.warning(f"DB debug failed: {e}")
+
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
     sem = asyncio.Semaphore(REQUEST_CONCURRENCY)
 
@@ -2939,7 +2963,7 @@ async def main():
             f"時間：<code>{utc_text()}</code>\n"
             f"固定追蹤：<code>{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}</code>\n"
             "功能：<code>Funding Radar + OI Radar + OI Signal Tracker</code>\n\n"
-            "你可以輸入：<code>/status</code>、<code>/oi</code>、<code>/oi_log</code> 或 <code>/oi_stats</code>\n"
+            "你可以輸入：<code>/status</code>、<code>/oi</code>、<code>/oi_log</code>、<code>/oi_stats</code> 或 <code>/oi_sim</code>\n"
             "系統已啟用 OI 自動掃描，強訊號會主動通知。"
         )
 
