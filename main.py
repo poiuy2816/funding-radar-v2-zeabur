@@ -2916,6 +2916,10 @@ class Scanner:
 # =========================
 async def main():
     logger.info("Funding Radar V2 Net Profit + OI Radar + OI Tracker starting")
+    logger.info(f"DB_PATH = {DB_PATH}")
+    logger.info(f"DB exists = {os.path.exists(DB_PATH)}")
+    if os.path.exists(DB_PATH):
+        logger.info(f"DB size = {os.path.getsize(DB_PATH)} bytes")
 
     db = RadarDB(DB_PATH)
     init_oi_tracker_db()
