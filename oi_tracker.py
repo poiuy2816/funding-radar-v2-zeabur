@@ -496,6 +496,8 @@ def format_oi_log(limit: int = 10) -> str:
     lines = []
     lines.append("📒 <b>OI 訊號紀錄｜最近訊號</b>")
     lines.append("")
+    lines.append("<code>15m / 30m / 60m 為依照 LONG/SHORT 方向換算後的報酬</code>")
+    lines.append("")
 
     for i, row in enumerate(rows, 1):
         status = row["status"]
@@ -506,11 +508,11 @@ def format_oi_log(limit: int = 10) -> str:
             f"時間：<code>{row['detected_at']}</code>\n"
             f"分數：<b>{row['score']}</b>\n"
             f"訊號價：<code>{format_price(row['entry_price'])}</code>\n"
-            f"15m：<b>{format_pct(row['return_15m'])}</b>｜"
+            f"方向報酬 15m：<b>{format_pct(row['return_15m'])}</b>｜"
             f"30m：<b>{format_pct(row['return_30m'])}</b>｜"
             f"60m：<b>{format_pct(row['return_60m'])}</b>\n"
-            f"MFE：<b>{format_pct(row['max_favorable_return'])}</b>｜"
-            f"MAE：<b>{format_pct(row['max_adverse_return'])}</b>\n"
+            f"MFE 最大有利：<b>{format_pct(row['max_favorable_return'])}</b>｜"
+            f"MAE 最大不利：<b>{format_pct(row['max_adverse_return'])}</b>\n"
             f"TP1：{'✅' if row['hit_tp1'] else '❌'}｜"
             f"TP2：{'✅' if row['hit_tp2'] else '❌'}｜"
             f"SL：{'✅' if row['hit_sl'] else '❌'}"
@@ -520,19 +522,28 @@ def format_oi_log(limit: int = 10) -> str:
     return "\n".join(lines)
 
 
+# =========================
+# Stats Helpers
+# =========================
+
 def rate(a: int, b: int) -> str:
     if b <= 0:
         return "-"
     return f"{a / b * 100:.1f}%"
 
 
-def avg_return(rows: List[sqlite3.Row], key: str) -> str:
-    vals = []
+def safe_row_float(row: sqlite3.Row, key: str, default=None):
+    try:
+        v = row[key]
+        if v is None:
+            return default
+        return float(v)
+    except Exception:
+        return default
 
-    for r in rows:
-        v = r[key]
-        if v is not None:
-            vals.append(float(v))
+
+def avg_pct_from_values(vals: List[float]) -> str:
+    vals = [float(v) for v in vals if v is not None]
 
     if not vals:
         return "-"
@@ -540,7 +551,145 @@ def avg_return(rows: List[sqlite3.Row], key: str) -> str:
     return f"{sum(vals) / len(vals) * 100:+.2f}%"
 
 
-def format_oi_stats(symbol: Optional[str] = None, lookback: Optional[int] = None) -> str:
+def avg_return(rows: List[sqlite3.Row], key: str) -> str:
+    vals = []
+
+    for r in rows:
+        v = safe_row_float(r, key, None)
+        if v is not None:
+            vals.append(v)
+
+    return avg_pct_from_values(vals)
+
+
+def avg_number(rows: List[sqlite3.Row], key: str) -> str:
+    vals = []
+
+    for r in rows:
+        v = safe_row_float(r, key, None)
+        if v is not None:
+            vals.append(v)
+
+    if not vals:
+        return "-"
+
+    return f"{sum(vals) / len(vals):.2f}"
+
+
+def status_upper(row: sqlite3.Row) -> str:
+    return str(row["status"] or "").upper()
+
+
+def is_tracking(row: sqlite3.Row) -> bool:
+    return status_upper(row) == "TRACKING"
+
+
+def is_tp1(row: sqlite3.Row) -> bool:
+    return status_upper(row) == "HIT_TP1"
+
+
+def is_tp2(row: sqlite3.Row) -> bool:
+    return status_upper(row) == "HIT_TP2"
+
+
+def is_win(row: sqlite3.Row) -> bool:
+    return status_upper(row) in ("HIT_TP1", "HIT_TP2")
+
+
+def is_loss(row: sqlite3.Row) -> bool:
+    return status_upper(row) == "HIT_SL"
+
+
+def is_expired(row: sqlite3.Row) -> bool:
+    return status_upper(row) == "EXPIRED"
+
+
+def is_closed(row: sqlite3.Row) -> bool:
+    return status_upper(row) in ("HIT_TP1", "HIT_TP2", "HIT_SL", "EXPIRED")
+
+
+def count_status(rows: List[sqlite3.Row], status: str) -> int:
+    status = status.upper()
+    return sum(1 for r in rows if status_upper(r) == status)
+
+
+def positive_count(rows: List[sqlite3.Row], key: str) -> int:
+    n = 0
+
+    for r in rows:
+        v = safe_row_float(r, key, None)
+        if v is not None and v > 0:
+            n += 1
+
+    return n
+
+
+def rows_with_value(rows: List[sqlite3.Row], key: str) -> List[sqlite3.Row]:
+    return [r for r in rows if safe_row_float(r, key, None) is not None]
+
+
+def calc_subset_summary(rows: List[sqlite3.Row]) -> Dict[str, Any]:
+    total = len(rows)
+    tracking = sum(1 for r in rows if is_tracking(r))
+    closed = sum(1 for r in rows if is_closed(r))
+    wins = sum(1 for r in rows if is_win(r))
+    losses = sum(1 for r in rows if is_loss(r))
+    expired = sum(1 for r in rows if is_expired(r))
+    tp1 = sum(1 for r in rows if is_tp1(r))
+    tp2 = sum(1 for r in rows if is_tp2(r))
+
+    strict_base = wins + losses + expired
+    trade_base = wins + losses
+
+    return {
+        "total": total,
+        "tracking": tracking,
+        "closed": closed,
+        "wins": wins,
+        "losses": losses,
+        "expired": expired,
+        "tp1": tp1,
+        "tp2": tp2,
+        "strict_base": strict_base,
+        "trade_base": trade_base,
+        "strict_win_rate": rate(wins, strict_base),
+        "trade_win_rate": rate(wins, trade_base),
+        "loss_rate": rate(losses, strict_base),
+        "expired_rate": rate(expired, strict_base),
+    }
+
+
+def format_subset_line(name: str, rows: List[sqlite3.Row]) -> str:
+    s = calc_subset_summary(rows)
+
+    return (
+        f"{name}：<b>{s['total']}</b> 筆｜"
+        f"勝 <b>{s['wins']}</b>｜敗 <b>{s['losses']}</b>｜過期 <b>{s['expired']}</b>｜"
+        f"交易勝率 <b>{s['trade_win_rate']}</b>"
+    )
+
+
+def score_bucket_rows(rows: List[sqlite3.Row], low: Optional[float] = None, high: Optional[float] = None) -> List[sqlite3.Row]:
+    result = []
+
+    for r in rows:
+        score = safe_row_float(r, "score", None)
+
+        if score is None:
+            continue
+
+        if low is not None and score < low:
+            continue
+
+        if high is not None and score >= high:
+            continue
+
+        result.append(r)
+
+    return result
+
+
+def get_latest_rows(symbol: Optional[str] = None, lookback: Optional[int] = None) -> List[sqlite3.Row]:
     if lookback is None:
         lookback = OI_STATS_LOOKBACK
 
@@ -566,50 +715,378 @@ def format_oi_stats(symbol: Optional[str] = None, lookback: Optional[int] = None
             LIMIT ?
         """, params).fetchall()
 
+    return rows
+
+
+# =========================
+# Enhanced OI Stats
+# =========================
+
+def format_oi_stats(symbol: Optional[str] = None, lookback: Optional[int] = None) -> str:
+    if lookback is None:
+        lookback = OI_STATS_LOOKBACK
+
+    rows = get_latest_rows(symbol=symbol, lookback=lookback)
+
+    if symbol:
+        symbol = symbol.upper().strip()
+
     if not rows:
         if symbol:
             return f"🎯 OI 訊號統計｜{symbol}\n\n目前沒有這個交易對的 OI 統計資料。"
         return "🎯 OI 訊號統計\n\n目前沒有 OI 統計資料。"
 
     total = len(rows)
-    tracking = sum(1 for r in rows if r["status"] == "TRACKING")
-    completed = total - tracking
 
-    hit_tp1 = sum(1 for r in rows if r["hit_tp1"])
-    hit_tp2 = sum(1 for r in rows if r["hit_tp2"])
-    hit_sl = sum(1 for r in rows if r["hit_sl"])
+    tracking = count_status(rows, "TRACKING")
+    hit_tp1_status = count_status(rows, "HIT_TP1")
+    hit_tp2_status = count_status(rows, "HIT_TP2")
+    hit_sl_status = count_status(rows, "HIT_SL")
+    expired_status = count_status(rows, "EXPIRED")
 
-    rows_15m = [r for r in rows if r["return_15m"] is not None]
-    rows_30m = [r for r in rows if r["return_30m"] is not None]
-    rows_60m = [r for r in rows if r["return_60m"] is not None]
+    closed_rows = [r for r in rows if is_closed(r)]
+    win_rows = [r for r in rows if is_win(r)]
+    loss_rows = [r for r in rows if is_loss(r)]
+    expired_rows = [r for r in rows if is_expired(r)]
 
-    pos_15m = sum(1 for r in rows_15m if r["return_15m"] > 0)
-    pos_30m = sum(1 for r in rows_30m if r["return_30m"] > 0)
-    pos_60m = sum(1 for r in rows_60m if r["return_60m"] > 0)
+    wins = len(win_rows)
+    losses = len(loss_rows)
+    expired = len(expired_rows)
 
-    long_rows = [r for r in rows if r["direction"] == "LONG"]
-    short_rows = [r for r in rows if r["direction"] == "SHORT"]
+    strict_base = wins + losses + expired
+    trade_base = wins + losses
 
-    title = "🎯 <b>OI 訊號統計</b>"
+    long_rows = [r for r in rows if str(r["direction"]).upper() == "LONG"]
+    short_rows = [r for r in rows if str(r["direction"]).upper() == "SHORT"]
+
+    rows_15m = rows_with_value(rows, "return_15m")
+    rows_30m = rows_with_value(rows, "return_30m")
+    rows_60m = rows_with_value(rows, "return_60m")
+
+    pos_15m = positive_count(rows_15m, "return_15m")
+    pos_30m = positive_count(rows_30m, "return_30m")
+    pos_60m = positive_count(rows_60m, "return_60m")
+
+    high_90_rows = score_bucket_rows(rows, low=90)
+    score_80_90_rows = score_bucket_rows(rows, low=80, high=90)
+    low_80_rows = score_bucket_rows(rows, high=80)
+
+    title = "🎯 <b>OI 訊號統計｜強化版</b>"
     if symbol:
         title += f"｜<b>{symbol}</b>"
 
     lines = []
     lines.append(title)
     lines.append("")
-    lines.append(f"統計筆數：<b>{total}</b>")
-    lines.append(f"追蹤中：<b>{tracking}</b>")
-    lines.append(f"已結案：<b>{completed}</b>")
+    lines.append(f"統計範圍：最近 <b>{total}</b> 筆 / 上限 <b>{lookback}</b> 筆")
+    lines.append(f"平均分數：<b>{avg_number(rows, 'score')}</b>")
     lines.append("")
-    lines.append(f"TP1 命中：<b>{hit_tp1}</b>｜{rate(hit_tp1, total)}")
-    lines.append(f"TP2 命中：<b>{hit_tp2}</b>｜{rate(hit_tp2, total)}")
-    lines.append(f"防守觸發：<b>{hit_sl}</b>｜{rate(hit_sl, total)}")
+    lines.append("📌 <b>狀態分布</b>")
+    lines.append(f"追蹤中 TRACKING：<b>{tracking}</b>")
+    lines.append(f"✅ HIT_TP1：<b>{hit_tp1_status}</b>")
+    lines.append(f"🏆 HIT_TP2：<b>{hit_tp2_status}</b>")
+    lines.append(f"🛑 HIT_SL：<b>{hit_sl_status}</b>")
+    lines.append(f"⌛ EXPIRED：<b>{expired_status}</b>")
     lines.append("")
-    lines.append(f"15m 正向率：<b>{pos_15m}/{len(rows_15m)}</b>｜{rate(pos_15m, len(rows_15m))}｜平均：<b>{avg_return(rows_15m, 'return_15m')}</b>")
-    lines.append(f"30m 正向率：<b>{pos_30m}/{len(rows_30m)}</b>｜{rate(pos_30m, len(rows_30m))}｜平均：<b>{avg_return(rows_30m, 'return_30m')}</b>")
-    lines.append(f"60m 正向率：<b>{pos_60m}/{len(rows_60m)}</b>｜{rate(pos_60m, len(rows_60m))}｜平均：<b>{avg_return(rows_60m, 'return_60m')}</b>")
+
+    lines.append("🏁 <b>勝負統計</b>")
+    lines.append(f"勝：<b>{wins}</b>｜敗：<b>{losses}</b>｜過期：<b>{expired}</b>")
+    lines.append(f"嚴格勝率：<b>{rate(wins, strict_base)}</b> <code>勝 / 勝+敗+過期</code>")
+    lines.append(f"交易勝率：<b>{rate(wins, trade_base)}</b> <code>勝 / 勝+敗</code>")
+    lines.append(f"TP2 率：<b>{rate(hit_tp2_status, strict_base)}</b>")
+    lines.append(f"SL 率：<b>{rate(losses, strict_base)}</b>")
     lines.append("")
-    lines.append(f"LONG 訊號：<b>{len(long_rows)}</b>")
-    lines.append(f"SHORT 訊號：<b>{len(short_rows)}</b>")
+
+    lines.append("⏱ <b>時間報酬統計</b>")
+    lines.append(
+        f"15m 正向率：<b>{pos_15m}/{len(rows_15m)}</b>｜"
+        f"{rate(pos_15m, len(rows_15m))}｜平均：<b>{avg_return(rows_15m, 'return_15m')}</b>"
+    )
+    lines.append(
+        f"30m 正向率：<b>{pos_30m}/{len(rows_30m)}</b>｜"
+        f"{rate(pos_30m, len(rows_30m))}｜平均：<b>{avg_return(rows_30m, 'return_30m')}</b>"
+    )
+    lines.append(
+        f"60m 正向率：<b>{pos_60m}/{len(rows_60m)}</b>｜"
+        f"{rate(pos_60m, len(rows_60m))}｜平均：<b>{avg_return(rows_60m, 'return_60m')}</b>"
+    )
+    lines.append("")
+
+    lines.append("📈 <b>MFE / MAE</b>")
+    lines.append(f"平均最大有利 MFE：<b>{avg_return(rows, 'max_favorable_return')}</b>")
+    lines.append(f"平均最大不利 MAE：<b>{avg_return(rows, 'max_adverse_return')}</b>")
+    lines.append("")
+
+    lines.append("🟢🔴 <b>多空拆分</b>")
+    lines.append(format_subset_line("LONG", long_rows))
+    lines.append(format_subset_line("SHORT", short_rows))
+    lines.append("")
+
+    lines.append("⭐ <b>分數區間</b>")
+    lines.append(format_subset_line("90 分以上", high_90_rows))
+    lines.append(format_subset_line("80～89 分", score_80_90_rows))
+    lines.append(format_subset_line("80 分以下", low_80_rows))
+    lines.append("")
+
+    lines.append("📖 <b>口徑說明</b>")
+    lines.append("勝：<code>HIT_TP1 / HIT_TP2</code>")
+    lines.append("敗：<code>HIT_SL</code>")
+    lines.append("過期：<code>EXPIRED</code>")
+    lines.append("嚴格勝率包含 EXPIRED，交易勝率不包含 EXPIRED。")
+
+    return "\n".join(lines)
+
+
+# =========================
+# OI Simulation
+# =========================
+
+OI_SIM_LEVERAGE = float(os.getenv("OI_SIM_LEVERAGE", "1"))
+OI_SIM_ROUNDTRIP_FEE_RATE = float(os.getenv("OI_SIM_ROUNDTRIP_FEE_RATE", "0.0008"))
+OI_SIM_SLIPPAGE_RATE = float(os.getenv("OI_SIM_SLIPPAGE_RATE", "0.0003"))
+OI_SIM_INCLUDE_EXPIRED = os.getenv("OI_SIM_INCLUDE_EXPIRED", "true").lower() == "true"
+
+
+def first_available_return(row: sqlite3.Row) -> Optional[float]:
+    for key in ("return_60m", "return_30m", "return_15m"):
+        v = safe_row_float(row, key, None)
+        if v is not None:
+            return v
+
+    return None
+
+
+def calc_target_return_from_row(row: sqlite3.Row, target_key: str) -> Optional[float]:
+    direction = str(row["direction"]).upper()
+    entry_price = safe_row_float(row, "entry_price", None)
+    target_price = safe_row_float(row, target_key, None)
+
+    if entry_price is None or target_price is None:
+        return None
+
+    return calc_directional_return(direction, entry_price, target_price)
+
+
+def estimate_exit_return(row: sqlite3.Row) -> Optional[float]:
+    """
+    用目前資料估算出場報酬。
+
+    HIT_TP2：用 tp2 價估算
+    HIT_TP1：用 tp1 價估算
+    HIT_SL：用 stop_price 價估算
+    EXPIRED：用 60m 報酬，沒有就用 30m，再沒有就用 15m
+    TRACKING：不納入
+    """
+    status = status_upper(row)
+
+    if status == "HIT_TP2":
+        r = calc_target_return_from_row(row, "tp2")
+        if r is not None:
+            return r
+        return safe_row_float(row, "max_favorable_return", None)
+
+    if status == "HIT_TP1":
+        r = calc_target_return_from_row(row, "tp1")
+        if r is not None:
+            return r
+        return safe_row_float(row, "max_favorable_return", None)
+
+    if status == "HIT_SL":
+        r = calc_target_return_from_row(row, "stop_price")
+        if r is not None:
+            return r
+        return safe_row_float(row, "max_adverse_return", None)
+
+    if status == "EXPIRED":
+        return first_available_return(row)
+
+    return None
+
+
+def calc_max_drawdown(returns: List[float]) -> float:
+    equity = 1.0
+    peak = 1.0
+    max_dd = 0.0
+
+    for r in returns:
+        equity *= (1.0 + r)
+
+        if equity > peak:
+            peak = equity
+
+        dd = (equity - peak) / peak
+
+        if dd < max_dd:
+            max_dd = dd
+
+    return max_dd
+
+
+def calc_profit_factor(returns: List[float]) -> str:
+    gross_profit = sum(r for r in returns if r > 0)
+    gross_loss = abs(sum(r for r in returns if r < 0))
+
+    if gross_loss <= 0:
+        if gross_profit > 0:
+            return "∞"
+        return "-"
+
+    return f"{gross_profit / gross_loss:.2f}"
+
+
+def max_consecutive_losses(returns: List[float]) -> int:
+    max_streak = 0
+    cur = 0
+
+    for r in returns:
+        if r < 0:
+            cur += 1
+            max_streak = max(max_streak, cur)
+        else:
+            cur = 0
+
+    return max_streak
+
+
+def format_oi_sim(symbol: Optional[str] = None, lookback: Optional[int] = None) -> str:
+    if lookback is None:
+        lookback = OI_STATS_LOOKBACK
+
+    rows = get_latest_rows(symbol=symbol, lookback=lookback)
+
+    if symbol:
+        symbol = symbol.upper().strip()
+
+    if not rows:
+        if symbol:
+            return f"📈 OI 模擬績效｜{symbol}\n\n目前沒有這個交易對的 OI 紀錄。"
+        return "📈 OI 模擬績效\n\n目前沒有 OI 紀錄。"
+
+    sim_rows = []
+
+    for r in rows:
+        if is_tracking(r):
+            continue
+
+        if is_expired(r) and not OI_SIM_INCLUDE_EXPIRED:
+            continue
+
+        gross_return = estimate_exit_return(r)
+
+        if gross_return is None:
+            continue
+
+        total_cost = OI_SIM_ROUNDTRIP_FEE_RATE + OI_SIM_SLIPPAGE_RATE
+        net_return = gross_return * OI_SIM_LEVERAGE - total_cost * OI_SIM_LEVERAGE
+
+        sim_rows.append({
+            "row": r,
+            "gross_return": gross_return,
+            "net_return": net_return,
+        })
+
+    if not sim_rows:
+        return (
+            "📈 <b>OI 模擬績效</b>\n\n"
+            "目前沒有足夠的已結案訊號可以模擬。"
+        )
+
+    net_returns = [x["net_return"] for x in sim_rows]
+    gross_returns = [x["gross_return"] for x in sim_rows]
+
+    total_trades = len(sim_rows)
+    wins = sum(1 for r in net_returns if r > 0)
+    losses = sum(1 for r in net_returns if r < 0)
+    flats = total_trades - wins - losses
+
+    avg_net = sum(net_returns) / len(net_returns)
+    total_simple = sum(net_returns)
+
+    equity = 1.0
+    for r in net_returns:
+        equity *= (1.0 + r)
+
+    compounded_return = equity - 1.0
+    max_dd = calc_max_drawdown(net_returns)
+    pf = calc_profit_factor(net_returns)
+    max_loss_streak = max_consecutive_losses(net_returns)
+
+    long_sim = [x for x in sim_rows if str(x["row"]["direction"]).upper() == "LONG"]
+    short_sim = [x for x in sim_rows if str(x["row"]["direction"]).upper() == "SHORT"]
+
+    def sim_subset_line(name: str, items: List[Dict[str, Any]]) -> str:
+        if not items:
+            return f"{name}：<b>0</b> 筆"
+
+        rs = [x["net_return"] for x in items]
+        w = sum(1 for r in rs if r > 0)
+
+        return (
+            f"{name}：<b>{len(items)}</b> 筆｜"
+            f"勝率 <b>{rate(w, len(items))}</b>｜"
+            f"平均 <b>{avg_pct_from_values(rs)}</b>｜"
+            f"總和 <b>{format_pct(sum(rs))}</b>"
+        )
+
+    best = sorted(sim_rows, key=lambda x: x["net_return"], reverse=True)[:3]
+    worst = sorted(sim_rows, key=lambda x: x["net_return"])[:3]
+
+    title = "📈 <b>OI 模擬績效</b>"
+    if symbol:
+        title += f"｜<b>{symbol}</b>"
+
+    lines = []
+    lines.append(title)
+    lines.append("")
+    lines.append(f"統計範圍：最近 <b>{len(rows)}</b> 筆 / 上限 <b>{lookback}</b> 筆")
+    lines.append(f"納入模擬：<b>{total_trades}</b> 筆已結案訊號")
+    lines.append("")
+    lines.append("⚙️ <b>模擬參數</b>")
+    lines.append(f"槓桿：<b>{OI_SIM_LEVERAGE:.1f}x</b>")
+    lines.append(f"來回手續費：<b>{format_pct(OI_SIM_ROUNDTRIP_FEE_RATE)}</b>")
+    lines.append(f"滑價成本：<b>{format_pct(OI_SIM_SLIPPAGE_RATE)}</b>")
+    lines.append(f"是否納入 EXPIRED：<b>{'是' if OI_SIM_INCLUDE_EXPIRED else '否'}</b>")
+    lines.append("")
+
+    lines.append("🏁 <b>模擬結果</b>")
+    lines.append(f"勝：<b>{wins}</b>｜敗：<b>{losses}</b>｜打平：<b>{flats}</b>")
+    lines.append(f"勝率：<b>{rate(wins, total_trades)}</b>")
+    lines.append(f"平均單筆淨報酬：<b>{format_pct(avg_net)}</b>")
+    lines.append(f"單利總報酬：<b>{format_pct(total_simple)}</b>")
+    lines.append(f"複利總報酬：<b>{format_pct(compounded_return)}</b>")
+    lines.append(f"最大回撤：<b>{format_pct(max_dd)}</b>")
+    lines.append(f"Profit Factor：<b>{pf}</b>")
+    lines.append(f"最大連虧：<b>{max_loss_streak}</b> 筆")
+    lines.append("")
+
+    lines.append("🟢🔴 <b>多空模擬</b>")
+    lines.append(sim_subset_line("LONG", long_sim))
+    lines.append(sim_subset_line("SHORT", short_sim))
+    lines.append("")
+
+    lines.append("🏆 <b>最佳 3 筆</b>")
+    for i, item in enumerate(best, 1):
+        r = item["row"]
+        lines.append(
+            f"#{i} <b>{r['symbol']}</b>｜{r['direction']}｜{status_emoji(r['status'])} {r['status']}｜"
+            f"<b>{format_pct(item['net_return'])}</b>"
+        )
+
+    lines.append("")
+    lines.append("🧊 <b>最差 3 筆</b>")
+    for i, item in enumerate(worst, 1):
+        r = item["row"]
+        lines.append(
+            f"#{i} <b>{r['symbol']}</b>｜{r['direction']}｜{status_emoji(r['status'])} {r['status']}｜"
+            f"<b>{format_pct(item['net_return'])}</b>"
+        )
+
+    lines.append("")
+    lines.append("📖 <b>模擬口徑</b>")
+    lines.append("HIT_TP1：以 TP1 價出場")
+    lines.append("HIT_TP2：以 TP2 價出場")
+    lines.append("HIT_SL：以 stop_price 出場")
+    lines.append("EXPIRED：以 60m 報酬估算，沒有 60m 則用 30m / 15m")
+    lines.append("此為粗略模擬，未處理同一根 K 線內 TP/SL 先後順序。")
 
     return "\n".join(lines)
