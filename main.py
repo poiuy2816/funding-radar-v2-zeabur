@@ -140,6 +140,14 @@ OI_HIST_LIMIT = int(
     os.getenv("OI_HIST_LIMIT", "4")
 )
 
+OI_AUTO_SCAN_ENABLED = os.getenv("OI_AUTO_SCAN_ENABLED", "true").lower() == "true"
+OI_AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("OI_AUTO_SCAN_INTERVAL_SECONDS", "600"))
+OI_AUTO_RECORD_MIN_SCORE = float(os.getenv("OI_AUTO_RECORD_MIN_SCORE", "65"))
+
+OI_AUTO_NOTIFY_ENABLED = os.getenv("OI_AUTO_NOTIFY_ENABLED", "true").lower() == "true"
+OI_AUTO_NOTIFY_MIN_SCORE = float(os.getenv("OI_AUTO_NOTIFY_MIN_SCORE", "85"))
+OI_AUTO_NOTIFY_MAX_PER_SCAN = int(os.getenv("OI_AUTO_NOTIFY_MAX_PER_SCAN", "5"))
+
 HIGH_RISK_CURRENT_RATE_THRESHOLD = float(os.getenv("HIGH_RISK_CURRENT_RATE_THRESHOLD", "0.0005"))
 ENABLE_HIGH_RISK_WATCHLIST = os.getenv("ENABLE_HIGH_RISK_WATCHLIST", "true").lower() == "true"
 
@@ -1662,6 +1670,366 @@ class Telegram:
                 f"<code>{self.h(e)}</code>"
             )
 
+    async def scan_oi_signals_only(self):
+        """
+        OI 掃描核心：
+        給手動 /oi 和自動掃描共用。
+        這裡只負責掃描 signals，不負責送 Telegram。
+        """
+        if self.api is None:
+            raise RuntimeError("OI 雷達尚未掛載 Binance API")
+
+        f_info, ticker_all, premium_all = await asyncio.gather(
+            self.api.futures_exchange_info(),
+            self.api.ticker_24h_all(),
+            self.api.premium_all(),
+        )
+
+        futures_symbols = parse_futures_symbols(f_info)
+        blacklist = self.db.blacklist()
+
+        premium_map = {
+            x.get("symbol"): x
+            for x in premium_all
+            if x.get("symbol")
+        }
+
+        candidates = []
+
+        for t in ticker_all:
+            symbol = t.get("symbol")
+
+            if not symbol:
+                continue
+
+            if symbol not in futures_symbols:
+                continue
+
+            if symbol in blacklist:
+                continue
+
+            try:
+                quote_volume = float(t.get("quoteVolume", 0))
+                last_price = float(t.get("lastPrice", 0))
+            except Exception:
+                continue
+
+            if quote_volume < OI_MIN_QUOTE_VOLUME_USDT:
+                continue
+
+            if last_price <= 0:
+                continue
+
+            candidates.append({
+                "symbol": symbol,
+                "quote_volume": quote_volume,
+                "last_price": last_price,
+            })
+
+        candidates.sort(
+            key=lambda x: x.get("quote_volume", 0),
+            reverse=True,
+        )
+
+        candidates = candidates[:OI_SCAN_UNIVERSE_LIMIT]
+
+        async def analyze_oi_candidate(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            symbol = c["symbol"]
+
+            try:
+                oi_hist, klines = await asyncio.gather(
+                    self.api.open_interest_hist(
+                        symbol,
+                        period="15m",
+                        limit=OI_HIST_LIMIT,
+                    ),
+                    self.api.futures_klines(
+                        symbol,
+                        interval="15m",
+                        limit=OI_KLINE_LIMIT,
+                    ),
+                )
+
+                oi_change = calc_oi_change_from_hist(oi_hist)
+                k = parse_klines_for_oi(klines)
+
+                if oi_change is None or k is None:
+                    return None
+
+                price_change = safe_float(k.get("price_change_15m"), 0.0)
+                volume_ratio = safe_float(k.get("volume_ratio"), 0.0)
+                price = safe_float(k.get("price"), 0.0)
+                rsi = k.get("rsi")
+                atr = k.get("atr")
+
+                if oi_change < OI_MIN_OI_CHANGE_15M:
+                    return None
+
+                if abs(price_change) < OI_MIN_PRICE_CHANGE_15M:
+                    return None
+
+                if volume_ratio < OI_MIN_VOLUME_RATIO:
+                    return None
+
+                if price_change > 0:
+                    direction = "LONG"
+                    direction_text = "偏多觀察"
+                    story = "價格上漲且 OI 同步增加，疑似新多單進場推動。"
+                else:
+                    direction = "SHORT"
+                    direction_text = "偏空觀察"
+                    story = "價格下跌但 OI 同步增加，疑似新空單進場壓制。"
+
+                premium = premium_map.get(symbol, {})
+                funding = safe_float(premium.get("lastFundingRate"), 0.0)
+
+                score, label = oi_signal_score(
+                    oi_change=oi_change,
+                    price_change=price_change,
+                    volume_ratio=volume_ratio,
+                    rsi=rsi,
+                    funding=funding,
+                    quote_volume=c["quote_volume"],
+                    direction=direction,
+                )
+
+                if score < OI_MIN_SCORE:
+                    return None
+
+                levels = build_oi_levels(price, atr, direction)
+
+                return {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "direction_text": direction_text,
+                    "story": story,
+                    "score": score,
+                    "label": label,
+                    "price": price,
+                    "price_change_15m": price_change,
+                    "oi_change_15m": oi_change,
+                    "volume_ratio": volume_ratio,
+                    "rsi": rsi,
+                    "atr": atr,
+                    "funding": funding,
+                    "quote_volume": c["quote_volume"],
+                    "levels": levels,
+                }
+
+            except Exception as e:
+                logger.warning(f"OI analyze failed {symbol}: {e}")
+                return None
+
+        results = await asyncio.gather(
+            *[analyze_oi_candidate(c) for c in candidates],
+            return_exceptions=True,
+        )
+
+        signals = []
+
+        for r in results:
+            if isinstance(r, dict):
+                signals.append(r)
+
+        signals.sort(
+            key=lambda x: (
+                x.get("score", 0),
+                abs(x.get("oi_change_15m", 0)),
+                x.get("quote_volume", 0),
+            ),
+            reverse=True,
+        )
+
+        signals = signals[:OI_SCAN_TOP_LIMIT]
+
+        return signals
+
+
+    def oi_signal_to_record_payload(self, s):
+        levels = s.get("levels", {}) or {}
+
+        return {
+            "symbol": s.get("symbol"),
+            "direction": s.get("direction"),
+            "score": s.get("score"),
+            "label": s.get("label"),
+            "entry_price": s.get("price"),
+            "price_change_15m": s.get("price_change_15m"),
+            "oi_change_15m": s.get("oi_change_15m"),
+            "volume_ratio": s.get("volume_ratio"),
+            "rsi": s.get("rsi"),
+            "atr": s.get("atr"),
+            "funding": s.get("funding"),
+            "quote_volume": s.get("quote_volume"),
+            "zone_low": levels.get("zone_low"),
+            "zone_high": levels.get("zone_high"),
+            "stop_price": levels.get("sl"),
+            "tp1": levels.get("tp1"),
+            "tp2": levels.get("tp2"),
+        }
+
+
+    def record_oi_signals(self, signals, min_score=None):
+        recorded_count = 0
+        duplicate_count = 0
+        skipped_count = 0
+        failed_count = 0
+        recorded_signals = []
+
+        for s in signals:
+            score = safe_float(s.get("score"), 0.0)
+
+            if min_score is not None and score < min_score:
+                skipped_count += 1
+                continue
+
+            ok, reason = record_oi_signal(
+                self.oi_signal_to_record_payload(s)
+            )
+
+            if ok:
+                recorded_count += 1
+                recorded_signals.append(s)
+            elif reason == "duplicate":
+                duplicate_count += 1
+            else:
+                failed_count += 1
+
+            logger.info(
+                f"[OI Tracker] {s.get('symbol')} {s.get('direction')} "
+                f"record={ok} reason={reason}"
+            )
+
+        return recorded_count, duplicate_count, skipped_count, failed_count, recorded_signals
+
+
+    def format_oi_auto_notify(self, signals, recorded_count, duplicate_count, skipped_count):
+        lines = [
+            "🚨 <b>OI 自動掃描強訊號</b>",
+            f"時間：<code>{utc_text()}</code>",
+            "",
+            f"新增紀錄：<b>{recorded_count}</b> 筆",
+            f"略過重複：<b>{duplicate_count}</b> 筆",
+            f"分數不足略過：<b>{skipped_count}</b> 筆",
+            "",
+        ]
+
+        for i, s in enumerate(signals, 1):
+            symbol = s.get("symbol")
+            direction = s.get("direction")
+            levels = s.get("levels", {}) or {}
+
+            if direction == "LONG":
+                emoji = "🟢"
+            elif direction == "SHORT":
+                emoji = "🔴"
+            else:
+                emoji = "⚪"
+
+            rsi_text = "N/A"
+            if s.get("rsi") is not None:
+                rsi_text = f"{float(s.get('rsi')):.1f}"
+
+            atr_text = "N/A"
+            if s.get("atr") is not None:
+                atr_text = self.fmt_price(s.get("atr"))
+
+            lines.append(
+                f"#{i} {emoji} <b>{self.h(symbol)}</b>｜<b>{self.h(s.get('direction_text'))}</b>\n"
+                f"分數：<b>{s.get('score')}/100</b>｜{self.h(s.get('label'))}\n"
+                f"現價：<code>{self.fmt_price(s.get('price'))}</code>\n"
+                f"15m 價格：<b>{fmt_signed_pct(s.get('price_change_15m'))}</b>\n"
+                f"15m OI：<b>{fmt_signed_pct(s.get('oi_change_15m'))}</b>\n"
+                f"成交量放大：<b>{safe_float(s.get('volume_ratio'), 0):.2f}x</b>\n"
+                f"Funding：<b>{fmt_pct(s.get('funding'))}</b>\n"
+                f"RSI：<code>{rsi_text}</code>｜ATR：<code>{atr_text}</code>\n"
+                f"24H 成交額：<code>{self.fmt_money(s.get('quote_volume'))}</code>\n"
+                f"解讀：{self.h(s.get('story'))}\n"
+                f"觀察區：<code>{self.fmt_price(levels.get('zone_low'))} ~ {self.fmt_price(levels.get('zone_high'))}</code>\n"
+                f"防守參考：<code>{self.fmt_price(levels.get('sl'))}</code>\n"
+                f"目標參考：<code>{self.fmt_price(levels.get('tp1'))} / {self.fmt_price(levels.get('tp2'))}</code>\n"
+            )
+
+        lines.append("查詢：<code>/oi_log</code>｜統計：<code>/oi_stats</code>")
+        lines.append("⚠️ 自動訊號只代表 OI 異常觀察，不是直接進場建議。")
+
+        return "\n".join(lines)
+
+
+    async def oi_auto_scan_loop(self):
+        if not OI_AUTO_SCAN_ENABLED:
+            logger.info("OI 自動掃描未啟用")
+            return
+
+        logger.info(
+            "OI 自動掃描啟動 | interval=%ss | record_score>=%.1f | notify_score>=%.1f",
+            OI_AUTO_SCAN_INTERVAL_SECONDS,
+            OI_AUTO_RECORD_MIN_SCORE,
+            OI_AUTO_NOTIFY_MIN_SCORE,
+        )
+
+        # 啟動後先等一下，避免和主程式初始化、第一輪 funding 掃描搶資源
+        await asyncio.sleep(30)
+
+        while True:
+            try:
+                logger.info("開始 OI 自動掃描")
+
+                signals = await self.scan_oi_signals_only()
+
+                if not signals:
+                    logger.info("OI 自動掃描完成：無訊號")
+                    await asyncio.sleep(OI_AUTO_SCAN_INTERVAL_SECONDS)
+                    continue
+
+                recorded_count, duplicate_count, skipped_count, failed_count, recorded_signals = self.record_oi_signals(
+                    signals,
+                    min_score=OI_AUTO_RECORD_MIN_SCORE,
+                )
+
+                notify_candidates = []
+
+                # 只通知「本輪新記錄成功」且分數達標的訊號
+                # 這樣可以避免 duplicate 訊號每 10 分鐘一直洗版
+                for s in recorded_signals:
+                    score = safe_float(s.get("score"), 0.0)
+
+                    if score >= OI_AUTO_NOTIFY_MIN_SCORE:
+                        notify_candidates.append(s)
+
+                notify_candidates.sort(
+                    key=lambda x: safe_float(x.get("score"), 0.0),
+                    reverse=True,
+                )
+
+                notify_candidates = notify_candidates[:OI_AUTO_NOTIFY_MAX_PER_SCAN]
+
+                logger.info(
+                    "OI 自動掃描完成 | signals=%s | recorded=%s | duplicate=%s | skipped=%s | failed=%s | notify=%s",
+                    len(signals),
+                    recorded_count,
+                    duplicate_count,
+                    skipped_count,
+                    failed_count,
+                    len(notify_candidates),
+                )
+
+                if OI_AUTO_NOTIFY_ENABLED and notify_candidates:
+                    text = self.format_oi_auto_notify(
+                        notify_candidates,
+                        recorded_count,
+                        duplicate_count,
+                        skipped_count,
+                    )
+
+                    await self.send(text)
+
+            except Exception as e:
+                logger.exception(f"OI 自動掃描錯誤：{e}")
+
+            await asyncio.sleep(OI_AUTO_SCAN_INTERVAL_SECONDS)
+
+
     async def cmd_oi(self):
         if self.api is None:
             await self.send("❌ OI 雷達尚未掛載 Binance API。")
@@ -1670,208 +2038,12 @@ class Telegram:
         await self.send("⏳ <b>OI 持倉異常雷達掃描中...</b>\n\n請稍候 10～30 秒。")
 
         try:
-            f_info, ticker_all, premium_all = await asyncio.gather(
-                self.api.futures_exchange_info(),
-                self.api.ticker_24h_all(),
-                self.api.premium_all(),
+            signals = await self.scan_oi_signals_only()
+
+            recorded_count, duplicate_count, skipped_count, failed_count, _recorded_signals = self.record_oi_signals(
+                signals,
+                min_score=None,
             )
-
-            futures_symbols = parse_futures_symbols(f_info)
-            blacklist = self.db.blacklist()
-
-            premium_map = {
-                x.get("symbol"): x
-                for x in premium_all
-                if x.get("symbol")
-            }
-
-            candidates = []
-
-            for t in ticker_all:
-                symbol = t.get("symbol")
-
-                if not symbol:
-                    continue
-
-                if symbol not in futures_symbols:
-                    continue
-
-                if symbol in blacklist:
-                    continue
-
-                try:
-                    quote_volume = float(t.get("quoteVolume", 0))
-                    last_price = float(t.get("lastPrice", 0))
-                except Exception:
-                    continue
-
-                if quote_volume < OI_MIN_QUOTE_VOLUME_USDT:
-                    continue
-
-                if last_price <= 0:
-                    continue
-
-                candidates.append({
-                    "symbol": symbol,
-                    "quote_volume": quote_volume,
-                    "last_price": last_price,
-                })
-
-            candidates.sort(
-                key=lambda x: x.get("quote_volume", 0),
-                reverse=True,
-            )
-
-            candidates = candidates[:OI_SCAN_UNIVERSE_LIMIT]
-
-            async def analyze_oi_candidate(c: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                symbol = c["symbol"]
-
-                try:
-                    oi_hist, klines = await asyncio.gather(
-                        self.api.open_interest_hist(
-                            symbol,
-                            period="15m",
-                            limit=OI_HIST_LIMIT,
-                        ),
-                        self.api.futures_klines(
-                            symbol,
-                            interval="15m",
-                            limit=OI_KLINE_LIMIT,
-                        ),
-                    )
-
-                    oi_change = calc_oi_change_from_hist(oi_hist)
-                    k = parse_klines_for_oi(klines)
-
-                    if oi_change is None or k is None:
-                        return None
-
-                    price_change = safe_float(k.get("price_change_15m"), 0.0)
-                    volume_ratio = safe_float(k.get("volume_ratio"), 0.0)
-                    price = safe_float(k.get("price"), 0.0)
-                    rsi = k.get("rsi")
-                    atr = k.get("atr")
-
-                    if oi_change < OI_MIN_OI_CHANGE_15M:
-                        return None
-
-                    if abs(price_change) < OI_MIN_PRICE_CHANGE_15M:
-                        return None
-
-                    if volume_ratio < OI_MIN_VOLUME_RATIO:
-                        return None
-
-                    if price_change > 0:
-                        direction = "LONG"
-                        direction_text = "偏多觀察"
-                        story = "價格上漲且 OI 同步增加，疑似新多單進場推動。"
-                    else:
-                        direction = "SHORT"
-                        direction_text = "偏空觀察"
-                        story = "價格下跌但 OI 同步增加，疑似新空單進場壓制。"
-
-                    premium = premium_map.get(symbol, {})
-                    funding = safe_float(premium.get("lastFundingRate"), 0.0)
-
-                    score, label = oi_signal_score(
-                        oi_change=oi_change,
-                        price_change=price_change,
-                        volume_ratio=volume_ratio,
-                        rsi=rsi,
-                        funding=funding,
-                        quote_volume=c["quote_volume"],
-                        direction=direction,
-                    )
-
-                    if score < OI_MIN_SCORE:
-                        return None
-
-                    levels = build_oi_levels(price, atr, direction)
-
-                    return {
-                        "symbol": symbol,
-                        "direction": direction,
-                        "direction_text": direction_text,
-                        "story": story,
-                        "score": score,
-                        "label": label,
-                        "price": price,
-                        "price_change_15m": price_change,
-                        "oi_change_15m": oi_change,
-                        "volume_ratio": volume_ratio,
-                        "rsi": rsi,
-                        "atr": atr,
-                        "funding": funding,
-                        "quote_volume": c["quote_volume"],
-                        "levels": levels,
-                    }
-
-                except Exception as e:
-                    logger.warning(f"OI analyze failed {symbol}: {e}")
-                    return None
-
-            results = await asyncio.gather(
-                *[analyze_oi_candidate(c) for c in candidates],
-                return_exceptions=True,
-            )
-
-            signals = []
-
-            for r in results:
-                if isinstance(r, dict):
-                    signals.append(r)
-
-            signals.sort(
-                key=lambda x: (
-                    x.get("score", 0),
-                    abs(x.get("oi_change_15m", 0)),
-                    x.get("quote_volume", 0),
-                ),
-                reverse=True,
-            )
-
-            signals = signals[:OI_SCAN_TOP_LIMIT]
-            
-            # =========================
-            # OI Signal Tracker：自動紀錄訊號
-            # =========================
-            recorded_count = 0
-            skipped_count = 0
-
-            for s in signals:
-                levels = s.get("levels", {})
-
-                ok, reason = record_oi_signal({
-                    "symbol": s.get("symbol"),
-                    "direction": s.get("direction"),
-                    "score": s.get("score"),
-                    "label": s.get("label"),
-                    "entry_price": s.get("price"),
-                    "price_change_15m": s.get("price_change_15m"),
-                    "oi_change_15m": s.get("oi_change_15m"),
-                    "volume_ratio": s.get("volume_ratio"),
-                    "rsi": s.get("rsi"),
-                    "atr": s.get("atr"),
-                    "funding": s.get("funding"),
-                    "quote_volume": s.get("quote_volume"),
-                    "zone_low": levels.get("zone_low"),
-                    "zone_high": levels.get("zone_high"),
-                    "stop_price": levels.get("sl"),
-                    "tp1": levels.get("tp1"),
-                    "tp2": levels.get("tp2"),
-                })
-
-                if ok:
-                    recorded_count += 1
-                else:
-                    skipped_count += 1
-
-                logger.info(
-                    f"[OI Tracker] {s.get('symbol')} {s.get('direction')} "
-                    f"record={ok} reason={reason}"
-                )
-
 
             if not signals:
                 await self.send(
@@ -1901,7 +2073,7 @@ class Telegram:
 
             for i, s in enumerate(signals, 1):
                 symbol = s["symbol"]
-                levels = s.get("levels", {})
+                levels = s.get("levels", {}) or {}
 
                 rsi_text = "N/A"
                 if s.get("rsi") is not None:
@@ -1935,10 +2107,11 @@ class Telegram:
             lines.append("")
             lines.append(
                 f"📒 <b>追蹤紀錄</b>：本次新增 <b>{recorded_count}</b> 筆，"
-                f"略過重複 <b>{skipped_count}</b> 筆。"
+                f"略過重複 <b>{duplicate_count}</b> 筆，"
+                f"分數略過 <b>{skipped_count}</b> 筆，"
+                f"失敗 <b>{failed_count}</b> 筆。"
             )
             lines.append("查詢：<code>/oi_log</code>｜統計：<code>/oi_stats</code>")
-
 
             await self.send("\n".join(lines))
 
@@ -2747,13 +2920,15 @@ async def main():
             f"時間：<code>{utc_text()}</code>\n"
             f"固定追蹤：<code>{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}</code>\n"
             "功能：<code>Funding Radar + OI Radar + OI Signal Tracker</code>\n\n"
-            "你可以輸入：<code>/status</code>、<code>/oi</code>、<code>/oi_log</code> 或 <code>/oi_stats</code>"
+            "你可以輸入：<code>/status</code>、<code>/oi</code>、<code>/oi_log</code> 或 <code>/oi_stats</code>\n"
+            "系統已啟用 OI 自動掃描，強訊號會主動通知。"
         )
-        
+
         await asyncio.gather(
             scanner.loop(),
             tg.poll_loop(),
             oi_tracker_loop(),
+            tg.oi_auto_scan_loop(),
         )
 
 
