@@ -4,6 +4,7 @@ from oi_tracker import (
     record_oi_signal,
     format_oi_log,
     format_oi_stats,
+    format_oi_sim,
 )
 
 import os
@@ -1597,6 +1598,10 @@ class Telegram:
             elif cmd == "/oi_stats":
                 symbol = norm_symbol(parts[1]) if len(parts) >= 2 else None
                 await self.cmd_oi_stats(symbol)
+                
+            elif cmd == "/oi_sim":
+                symbol = norm_symbol(parts[1]) if len(parts) >= 2 else None
+                await self.cmd_oi_sim(symbol)
 
             elif cmd == "/why" and len(parts) >= 2:
                 await self.cmd_why(norm_symbol(parts[1]))
@@ -1670,6 +1675,16 @@ class Telegram:
                 f"<code>{self.h(e)}</code>"
             )
 
+    async def cmd_oi_sim(self, symbol=None):
+        try:
+            await self.send(format_oi_sim(symbol=symbol))
+        except Exception as e:
+            logger.exception(f"cmd_oi_sim error: {e}")
+            await self.send(
+                "❌ <b>OI 模擬績效查詢失敗</b>\n\n"
+                f"<code>{self.h(e)}</code>"
+            )
+            
     async def scan_oi_signals_only(self):
         """
         OI 掃描核心：
