@@ -5,6 +5,7 @@ from oi_tracker import (
     format_oi_log,
     format_oi_stats,
     format_oi_sim,
+    parse_oi_sim_since_text,
 )
 
 import os
@@ -1603,6 +1604,15 @@ class Telegram:
                 symbol = norm_symbol(parts[1]) if len(parts) >= 2 else None
                 await self.cmd_oi_sim(symbol)
 
+            elif cmd == "/oi_sim_since":
+                await self.cmd_oi_sim_since(parts[1:])
+
+            elif cmd == "/oi_sim_long":
+                await self.cmd_oi_sim_direction("LONG")
+
+            elif cmd == "/oi_sim_short":
+                await self.cmd_oi_sim_direction("SHORT")
+
             elif cmd == "/why" and len(parts) >= 2:
                 await self.cmd_why(norm_symbol(parts[1]))
 
@@ -1646,6 +1656,10 @@ class Telegram:
                     "<code>/oi_log</code>\n"
                     "<code>/oi_stats</code>\n"
                     "<code>/oi_stats FILUSDT</code>\n"
+                    "<code>/oi_sim</code>\n"
+                    "<code>/oi_sim_long</code>\n"
+                    "<code>/oi_sim_short</code>\n"
+                    "<code>/oi_sim_since 2026-05-12</code>\n"
                     "<code>/why ETHUSDT</code>"
                 )
 
@@ -1685,6 +1699,58 @@ class Telegram:
                 f"<code>{self.h(e)}</code>"
             )
             
+    async def cmd_oi_sim_direction(self, direction: str):
+        try:
+            await self.send(format_oi_sim(direction=direction))
+        except Exception as e:
+            logger.exception(f"cmd_oi_sim_{direction.lower()} error: {e}")
+            await self.send(
+                "❌ <b>OI 模擬績效查詢失敗</b>\n\n"
+                f"<code>{self.h(e)}</code>"
+            )
+
+    async def cmd_oi_sim_since(self, args: List[str]):
+        if len(args) == 1:
+            since_input = args[0]
+        elif len(args) == 2:
+            since_input = f"{args[0]} {args[1]}"
+        else:
+            await self.send(
+                "❌ <b>/oi_sim_since 參數格式錯誤</b>\n\n"
+                "用法：\n"
+                "<code>/oi_sim_since 2026-05-12</code>\n"
+                "<code>/oi_sim_since 2026-05-12 01:14</code>\n\n"
+                "時間以 <code>UTC</code> 的 <code>detected_ts / detected_at</code> 為準。"
+            )
+            return
+
+        parsed = parse_oi_sim_since_text(since_input)
+
+        if not parsed:
+            await self.send(
+                "❌ <b>/oi_sim_since 參數格式錯誤</b>\n\n"
+                "用法：\n"
+                "<code>/oi_sim_since 2026-05-12</code>\n"
+                "<code>/oi_sim_since 2026-05-12 01:14</code>\n\n"
+                "日期代表當天 <code>00:00:00 UTC</code>。"
+            )
+            return
+
+        try:
+            await self.send(
+                format_oi_sim(
+                    lookback=0,
+                    since_ts=parsed["ts"],
+                    since_text=parsed["text"],
+                )
+            )
+        except Exception as e:
+            logger.exception(f"cmd_oi_sim_since error: {e}")
+            await self.send(
+                "❌ <b>OI 模擬績效查詢失敗</b>\n\n"
+                f"<code>{self.h(e)}</code>"
+            )
+
     async def scan_oi_signals_only(self):
         """
         OI 掃描核心：
@@ -2254,6 +2320,10 @@ class Telegram:
             "/oi_log - 查看最近 OI 訊號追蹤紀錄\n"
             "/oi_stats - 查看 OI 訊號統計\n"
             "/oi_stats SYMBOL - 查看單一交易對 OI 統計\n"
+            "/oi_sim - OI 模擬績效\n"
+            "/oi_sim_long - 只看 LONG OI 模擬績效\n"
+            "/oi_sim_short - 只看 SHORT OI 模擬績效\n"
+            "/oi_sim_since 2026-05-12 - 指定 UTC 時間之後的 OI 模擬績效\n"
             "/why SYMBOL - 查看單一交易對診斷\n\n"
             "⏸ <b>控制</b>\n"
             "/pause - 暫停掃描\n"

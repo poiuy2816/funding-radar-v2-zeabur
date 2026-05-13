@@ -689,19 +689,40 @@ def score_bucket_rows(rows: List[sqlite3.Row], low: Optional[float] = None, high
     return result
 
 
-def get_latest_rows(symbol: Optional[str] = None, lookback: Optional[int] = None) -> List[sqlite3.Row]:
+def get_latest_rows(
+    symbol: Optional[str] = None,
+    lookback: Optional[int] = None,
+    direction: Optional[str] = None,
+    since_ts: Optional[int] = None,
+) -> List[sqlite3.Row]:
     if lookback is None:
         lookback = OI_STATS_LOOKBACK
 
     params = []
-    where = ""
+    where_parts = []
 
     if symbol:
         symbol = symbol.upper().strip()
-        where = "WHERE symbol = ?"
+        where_parts.append("symbol = ?")
         params.append(symbol)
 
-    params.append(lookback)
+    if direction:
+        direction = direction.upper().strip()
+        where_parts.append("UPPER(direction) = ?")
+        params.append(direction)
+
+    if since_ts is not None:
+        where_parts.append("detected_ts >= ?")
+        params.append(int(since_ts))
+
+    where = ""
+    if where_parts:
+        where = "WHERE " + " AND ".join(where_parts)
+
+    limit_clause = ""
+    if lookback is not None and lookback > 0:
+        limit_clause = "LIMIT ?"
+        params.append(lookback)
 
     with get_conn() as conn:
         conn.row_factory = sqlite3.Row
@@ -712,7 +733,7 @@ def get_latest_rows(symbol: Optional[str] = None, lookback: Optional[int] = None
             FROM oi_signals
             {where}
             ORDER BY detected_ts DESC
-            LIMIT ?
+            {limit_clause}
         """, params).fetchall()
 
     return rows
@@ -777,6 +798,11 @@ def format_oi_stats(symbol: Optional[str] = None, lookback: Optional[int] = None
 
     lines = []
     lines.append(title)
+    if "since_text" in locals() and since_text:
+        lines.append(f"統計範圍：<b>{since_text}</b> 之後")
+        lines.append("時間基準：<code>detected_ts / detected_at UTC</code>")
+    if "direction" in locals() and direction:
+        lines.append(f"方向篩選：<b>{direction}</b>")
     lines.append("")
     lines.append(f"統計範圍：最近 <b>{total}</b> 筆 / 上限 <b>{lookback}</b> 筆")
     lines.append(f"平均分數：<b>{avg_number(rows, 'score')}</b>")
@@ -845,6 +871,22 @@ OI_SIM_LEVERAGE = float(os.getenv("OI_SIM_LEVERAGE", "1"))
 OI_SIM_ROUNDTRIP_FEE_RATE = float(os.getenv("OI_SIM_ROUNDTRIP_FEE_RATE", "0.0008"))
 OI_SIM_SLIPPAGE_RATE = float(os.getenv("OI_SIM_SLIPPAGE_RATE", "0.0003"))
 OI_SIM_INCLUDE_EXPIRED = os.getenv("OI_SIM_INCLUDE_EXPIRED", "true").lower() == "true"
+
+
+def parse_oi_sim_since_text(text: str) -> Optional[Dict[str, Any]]:
+    text = str(text or "").strip()
+
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            return {
+                "ts": int(dt.timestamp()),
+                "text": dt.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+        except ValueError:
+            continue
+
+    return None
 
 
 def first_available_return(row: sqlite3.Row) -> Optional[float]:
@@ -948,14 +990,28 @@ def max_consecutive_losses(returns: List[float]) -> int:
     return max_streak
 
 
-def format_oi_sim(symbol: Optional[str] = None, lookback: Optional[int] = None) -> str:
+def format_oi_sim(
+    symbol: Optional[str] = None,
+    lookback: Optional[int] = None,
+    direction: Optional[str] = None,
+    since_ts: Optional[int] = None,
+    since_text: Optional[str] = None,
+) -> str:
     if lookback is None:
         lookback = OI_STATS_LOOKBACK
 
-    rows = get_latest_rows(symbol=symbol, lookback=lookback)
+    rows = get_latest_rows(
+        symbol=symbol,
+        lookback=lookback,
+        direction=direction,
+        since_ts=since_ts,
+    )
 
     if symbol:
         symbol = symbol.upper().strip()
+
+    if direction:
+        direction = direction.upper().strip()
 
     if not rows:
         if symbol:
@@ -1037,8 +1093,14 @@ def format_oi_sim(symbol: Optional[str] = None, lookback: Optional[int] = None) 
 
     lines = []
     lines.append(title)
+    if "since_text" in locals() and since_text:
+        lines.append(f"統計範圍：<b>{since_text}</b> 之後")
+        lines.append("時間基準：<code>detected_ts / detected_at UTC</code>")
+    if "direction" in locals() and direction:
+        lines.append(f"方向篩選：<b>{direction}</b>")
     lines.append("")
-    lines.append(f"統計範圍：最近 <b>{len(rows)}</b> 筆 / 上限 <b>{lookback}</b> 筆")
+    if not since_text:
+        lines.append(f"統計範圍：最近 <b>{len(rows)}</b> 筆 / 上限 <b>{lookback}</b> 筆")
     lines.append(f"納入模擬：<b>{total_trades}</b> 筆已結案訊號")
     lines.append("")
     lines.append("⚙️ <b>模擬參數</b>")
