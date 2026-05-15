@@ -2,7 +2,7 @@ import os
 import time
 import sqlite3
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 
 import aiohttp
@@ -16,8 +16,14 @@ OI_TRACK_CHECK_INTERVAL_SECONDS = int(os.getenv("OI_TRACK_CHECK_INTERVAL_SECONDS
 OI_SIGNAL_DEDUP_SECONDS = int(os.getenv("OI_SIGNAL_DEDUP_SECONDS", "900"))
 OI_SIGNAL_EXPIRE_SECONDS = int(os.getenv("OI_SIGNAL_EXPIRE_SECONDS", "3600"))
 OI_STATS_LOOKBACK = int(os.getenv("OI_STATS_LOOKBACK", "100"))
+OI_RECORD_LONG = os.getenv("OI_RECORD_LONG", "true").lower() == "true"
+OI_RECORD_SHORT = os.getenv("OI_RECORD_SHORT", "true").lower() == "true"
+OI_SYMBOL_COOLDOWN_SECONDS = int(os.getenv("OI_SYMBOL_COOLDOWN_SECONDS", "0"))
+OI_MAX_PRICE_CHANGE_15M = float(os.getenv("OI_MAX_PRICE_CHANGE_15M", "0"))
+OI_MAX_OI_CHANGE_15M = float(os.getenv("OI_MAX_OI_CHANGE_15M", "0"))
 
 BINANCE_FAPI_BASE_URL = os.getenv("BINANCE_FAPI_BASE_URL", "https://fapi.binance.com")
+TAIPEI_TZ = timezone(timedelta(hours=8))
 
 
 def utc_now_ts() -> int:
@@ -26,6 +32,17 @@ def utc_now_ts() -> int:
 
 def utc_now_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def taipei_now_text() -> str:
+    return datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S 台灣時間")
+
+
+def taipei_text_from_ts(ts: Optional[int]) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts), TAIPEI_TZ).strftime("%Y-%m-%d %H:%M:%S 台灣時間")
+    except Exception:
+        return "-"
 
 
 def ensure_data_dir():
@@ -180,6 +197,57 @@ def should_skip_duplicate(symbol: str, direction: str) -> bool:
     return row is not None
 
 
+def should_skip_symbol_cooldown(symbol: str) -> bool:
+    if OI_SYMBOL_COOLDOWN_SECONDS <= 0:
+        return False
+
+    now_ts = utc_now_ts()
+    since_ts = now_ts - OI_SYMBOL_COOLDOWN_SECONDS
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        row = cur.execute("""
+            SELECT id
+            FROM oi_signals
+            WHERE symbol = ?
+              AND detected_ts >= ?
+            ORDER BY detected_ts DESC
+            LIMIT 1
+        """, (symbol, since_ts)).fetchone()
+
+    return row is not None
+
+
+def is_direction_record_enabled(direction: str) -> bool:
+    if direction == "LONG":
+        return OI_RECORD_LONG
+    if direction == "SHORT":
+        return OI_RECORD_SHORT
+    return True
+
+
+def overheat_reason(signal: Dict[str, Any]) -> Optional[str]:
+    price_change = signal.get("price_change_15m")
+    oi_change = signal.get("oi_change_15m")
+
+    if OI_MAX_PRICE_CHANGE_15M > 0:
+        try:
+            if abs(float(price_change)) > OI_MAX_PRICE_CHANGE_15M:
+                return "PRICE_OVERHEAT"
+        except Exception:
+            pass
+
+    if OI_MAX_OI_CHANGE_15M > 0:
+        try:
+            if abs(float(oi_change)) > OI_MAX_OI_CHANGE_15M:
+                return "OI_OVERHEAT"
+        except Exception:
+            pass
+
+    return None
+
+
 def record_oi_signal(signal: Dict[str, Any]):
     """
     signal 格式：
@@ -213,6 +281,13 @@ def record_oi_signal(signal: Dict[str, Any]):
     if not symbol or not direction:
         return False, "missing_symbol_or_direction"
 
+    if not is_direction_record_enabled(direction):
+        if direction == "LONG":
+            return False, "LONG_DISABLED"
+        if direction == "SHORT":
+            return False, "SHORT_DISABLED"
+        return False, "DIRECTION_DISABLED"
+
     entry_price = signal.get("entry_price")
 
     try:
@@ -224,6 +299,13 @@ def record_oi_signal(signal: Dict[str, Any]):
 
     if should_skip_duplicate(symbol, direction):
         return False, "duplicate_skipped"
+
+    if should_skip_symbol_cooldown(symbol):
+        return False, "SYMBOL_COOLDOWN"
+
+    reason = overheat_reason(signal)
+    if reason:
+        return False, reason
 
     now_ts = utc_now_ts()
     now_text = utc_now_text()
@@ -478,23 +560,39 @@ def status_emoji(status: str) -> str:
     return "•"
 
 
-def format_oi_log(limit: int = 10) -> str:
+def format_oi_log(limit: int = 10, direction: Optional[str] = None) -> str:
+    params = []
+    where = ""
+
+    if direction:
+        direction = direction.upper().strip()
+        where = "WHERE UPPER(direction) = ?"
+        params.append(direction)
+
+    params.append(limit)
+
     with get_conn() as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        rows = cur.execute("""
+        rows = cur.execute(f"""
             SELECT *
             FROM oi_signals
+            {where}
             ORDER BY detected_ts DESC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """, params).fetchall()
 
     if not rows:
+        if direction:
+            return f"📒 OI 訊號紀錄｜{direction}\n\n目前沒有 {direction} OI 訊號紀錄。"
         return "📒 OI 訊號紀錄\n\n目前沒有 OI 訊號紀錄。"
 
     lines = []
-    lines.append("📒 <b>OI 訊號紀錄｜最近訊號</b>")
+    title = "📒 <b>OI 訊號紀錄｜最近訊號</b>"
+    if direction:
+        title += f"｜<b>{direction}</b>"
+    lines.append(title)
     lines.append("")
     lines.append("<code>15m / 30m / 60m 為依照 LONG/SHORT 方向換算後的報酬</code>")
     lines.append("")
@@ -505,7 +603,7 @@ def format_oi_log(limit: int = 10) -> str:
 
         lines.append(
             f"#{i} <b>{row['symbol']}</b>｜<b>{row['direction']}</b>｜{icon} <code>{status}</code>\n"
-            f"時間：<code>{row['detected_at']}</code>\n"
+            f"時間：<code>{taipei_text_from_ts(row['detected_ts'])}</code>\n"
             f"分數：<b>{row['score']}</b>\n"
             f"訊號價：<code>{format_price(row['entry_price'])}</code>\n"
             f"方向報酬 15m：<b>{format_pct(row['return_15m'])}</b>｜"
@@ -743,16 +841,25 @@ def get_latest_rows(
 # Enhanced OI Stats
 # =========================
 
-def format_oi_stats(symbol: Optional[str] = None, lookback: Optional[int] = None) -> str:
+def format_oi_stats(
+    symbol: Optional[str] = None,
+    lookback: Optional[int] = None,
+    direction: Optional[str] = None,
+) -> str:
     if lookback is None:
         lookback = OI_STATS_LOOKBACK
 
-    rows = get_latest_rows(symbol=symbol, lookback=lookback)
+    rows = get_latest_rows(symbol=symbol, lookback=lookback, direction=direction)
 
     if symbol:
         symbol = symbol.upper().strip()
 
+    if direction:
+        direction = direction.upper().strip()
+
     if not rows:
+        if direction:
+            return f"🎯 OI 訊號統計｜{direction}\n\n目前沒有 {direction} OI 統計資料。"
         if symbol:
             return f"🎯 OI 訊號統計｜{symbol}\n\n目前沒有這個交易對的 OI 統計資料。"
         return "🎯 OI 訊號統計\n\n目前沒有 OI 統計資料。"
@@ -795,13 +902,12 @@ def format_oi_stats(symbol: Optional[str] = None, lookback: Optional[int] = None
     title = "🎯 <b>OI 訊號統計｜強化版</b>"
     if symbol:
         title += f"｜<b>{symbol}</b>"
+    if direction:
+        title += f"｜<b>{direction}</b>"
 
     lines = []
     lines.append(title)
-    if "since_text" in locals() and since_text:
-        lines.append(f"統計範圍：<b>{since_text}</b> 之後")
-        lines.append("時間基準：<code>detected_ts / detected_at UTC</code>")
-    if "direction" in locals() and direction:
+    if direction:
         lines.append(f"方向篩選：<b>{direction}</b>")
     lines.append("")
     lines.append(f"統計範圍：最近 <b>{total}</b> 筆 / 上限 <b>{lookback}</b> 筆")
@@ -878,10 +984,10 @@ def parse_oi_sim_since_text(text: str) -> Optional[Dict[str, Any]]:
 
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            dt = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(text, fmt).replace(tzinfo=TAIPEI_TZ)
             return {
                 "ts": int(dt.timestamp()),
-                "text": dt.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "text": dt.strftime("%Y-%m-%d %H:%M:%S 台灣時間"),
             }
         except ValueError:
             continue
@@ -1095,7 +1201,8 @@ def format_oi_sim(
     lines.append(title)
     if "since_text" in locals() and since_text:
         lines.append(f"統計範圍：<b>{since_text}</b> 之後")
-        lines.append("時間基準：<code>detected_ts / detected_at UTC</code>")
+        lines.append("輸入時間：<code>台灣時間 UTC+8</code>")
+        lines.append("資料儲存：<code>detected_ts / detected_at UTC</code>")
     if "direction" in locals() and direction:
         lines.append(f"方向篩選：<b>{direction}</b>")
     lines.append("")

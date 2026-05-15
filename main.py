@@ -6,6 +6,7 @@ from oi_tracker import (
     format_oi_stats,
     format_oi_sim,
     parse_oi_sim_since_text,
+    taipei_now_text,
 )
 
 import os
@@ -149,6 +150,8 @@ OI_AUTO_RECORD_MIN_SCORE = float(os.getenv("OI_AUTO_RECORD_MIN_SCORE", "65"))
 OI_AUTO_NOTIFY_ENABLED = os.getenv("OI_AUTO_NOTIFY_ENABLED", "true").lower() == "true"
 OI_AUTO_NOTIFY_MIN_SCORE = float(os.getenv("OI_AUTO_NOTIFY_MIN_SCORE", "85"))
 OI_AUTO_NOTIFY_MAX_PER_SCAN = int(os.getenv("OI_AUTO_NOTIFY_MAX_PER_SCAN", "5"))
+OI_NOTIFY_LONG = os.getenv("OI_NOTIFY_LONG", "true").lower() == "true"
+OI_NOTIFY_SHORT = os.getenv("OI_NOTIFY_SHORT", "true").lower() == "true"
 
 HIGH_RISK_CURRENT_RATE_THRESHOLD = float(os.getenv("HIGH_RISK_CURRENT_RATE_THRESHOLD", "0.0005"))
 ENABLE_HIGH_RISK_WATCHLIST = os.getenv("ENABLE_HIGH_RISK_WATCHLIST", "true").lower() == "true"
@@ -207,6 +210,10 @@ def now_ts() -> int:
 
 def utc_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def display_time_text() -> str:
+    return taipei_now_text()
 
 
 def fmt_pct(x: Optional[float], digits: int = 4) -> str:
@@ -1596,9 +1603,21 @@ class Telegram:
             elif cmd == "/oi_log":
                 await self.cmd_oi_log()
 
+            elif cmd == "/oi_log_long":
+                await self.cmd_oi_log("LONG")
+
+            elif cmd == "/oi_log_short":
+                await self.cmd_oi_log("SHORT")
+
             elif cmd == "/oi_stats":
                 symbol = norm_symbol(parts[1]) if len(parts) >= 2 else None
                 await self.cmd_oi_stats(symbol)
+
+            elif cmd == "/oi_stats_long":
+                await self.cmd_oi_stats_direction("LONG")
+
+            elif cmd == "/oi_stats_short":
+                await self.cmd_oi_stats_direction("SHORT")
                 
             elif cmd == "/oi_sim":
                 symbol = norm_symbol(parts[1]) if len(parts) >= 2 else None
@@ -1654,7 +1673,11 @@ class Telegram:
                     "<code>/top16</code>\n"
                     "<code>/oi</code>\n"
                     "<code>/oi_log</code>\n"
+                    "<code>/oi_log_long</code>\n"
+                    "<code>/oi_log_short</code>\n"
                     "<code>/oi_stats</code>\n"
+                    "<code>/oi_stats_long</code>\n"
+                    "<code>/oi_stats_short</code>\n"
                     "<code>/oi_stats FILUSDT</code>\n"
                     "<code>/oi_sim</code>\n"
                     "<code>/oi_sim_long</code>\n"
@@ -1667,9 +1690,9 @@ class Telegram:
             logger.exception(f"Telegram command error: {e}")
             await self.send(f"❌ <b>指令錯誤</b>\n\n<code>{self.h(e)}</code>")
             
-    async def cmd_oi_log(self):
+    async def cmd_oi_log(self, direction: Optional[str] = None):
         try:
-            text = format_oi_log(limit=10)
+            text = format_oi_log(limit=10, direction=direction)
             await self.send(text)
         except Exception as e:
             logger.exception(f"cmd_oi_log error: {e}")
@@ -1684,6 +1707,17 @@ class Telegram:
             await self.send(text)
         except Exception as e:
             logger.exception(f"cmd_oi_stats error: {e}")
+            await self.send(
+                "❌ <b>OI 訊號統計查詢失敗</b>\n\n"
+                f"<code>{self.h(e)}</code>"
+            )
+
+    async def cmd_oi_stats_direction(self, direction: str):
+        try:
+            text = format_oi_stats(direction=direction)
+            await self.send(text)
+        except Exception as e:
+            logger.exception(f"cmd_oi_stats_{direction.lower()} error: {e}")
             await self.send(
                 "❌ <b>OI 訊號統計查詢失敗</b>\n\n"
                 f"<code>{self.h(e)}</code>"
@@ -1720,7 +1754,7 @@ class Telegram:
                 "用法：\n"
                 "<code>/oi_sim_since 2026-05-12</code>\n"
                 "<code>/oi_sim_since 2026-05-12 01:14</code>\n\n"
-                "時間以 <code>UTC</code> 的 <code>detected_ts / detected_at</code> 為準。"
+                "請輸入 <code>台灣時間 UTC+8</code>；資料庫仍以 UTC 儲存。"
             )
             return
 
@@ -1732,7 +1766,7 @@ class Telegram:
                 "用法：\n"
                 "<code>/oi_sim_since 2026-05-12</code>\n"
                 "<code>/oi_sim_since 2026-05-12 01:14</code>\n\n"
-                "日期代表當天 <code>00:00:00 UTC</code>。"
+                "日期代表當天 <code>00:00:00 台灣時間</code>。"
             )
             return
 
@@ -1971,8 +2005,16 @@ class Telegram:
             if ok:
                 recorded_count += 1
                 recorded_signals.append(s)
-            elif reason == "duplicate":
+            elif reason in ("duplicate", "duplicate_skipped"):
                 duplicate_count += 1
+            elif reason in (
+                "LONG_DISABLED",
+                "SHORT_DISABLED",
+                "SYMBOL_COOLDOWN",
+                "PRICE_OVERHEAT",
+                "OI_OVERHEAT",
+            ):
+                skipped_count += 1
             else:
                 failed_count += 1
 
@@ -1984,14 +2026,26 @@ class Telegram:
         return recorded_count, duplicate_count, skipped_count, failed_count, recorded_signals
 
 
+    def should_notify_oi_signal(self, signal: Dict[str, Any]) -> bool:
+        direction = str(signal.get("direction", "")).upper()
+
+        if direction == "LONG":
+            return OI_NOTIFY_LONG
+
+        if direction == "SHORT":
+            return OI_NOTIFY_SHORT
+
+        return True
+
+
     def format_oi_auto_notify(self, signals, recorded_count, duplicate_count, skipped_count):
         lines = [
             "🚨 <b>OI 自動掃描強訊號</b>",
-            f"時間：<code>{utc_text()}</code>",
+            f"時間：<code>{display_time_text()}</code>",
             "",
             f"新增紀錄：<b>{recorded_count}</b> 筆",
             f"略過重複：<b>{duplicate_count}</b> 筆",
-            f"分數不足略過：<b>{skipped_count}</b> 筆",
+            f"規則略過：<b>{skipped_count}</b> 筆",
             "",
         ]
 
@@ -2075,7 +2129,10 @@ class Telegram:
                 for s in recorded_signals:
                     score = safe_float(s.get("score"), 0.0)
 
-                    if score >= OI_AUTO_NOTIFY_MIN_SCORE:
+                    if (
+                        score >= OI_AUTO_NOTIFY_MIN_SCORE
+                        and self.should_notify_oi_signal(s)
+                    ):
                         notify_candidates.append(s)
 
                 notify_candidates.sort(
@@ -2141,7 +2198,7 @@ class Telegram:
 
             lines = [
                 "🎯 <b>持倉異常狙擊鏡｜Binance OI 雷達</b>",
-                f"時間：<code>{utc_text()}</code>",
+                f"時間：<code>{display_time_text()}</code>",
                 "<code>模式：15m OI + 價格 + 成交量 + RSI + Funding</code>",
                 "",
                 "📌 判斷邏輯：",
@@ -2189,7 +2246,7 @@ class Telegram:
             lines.append(
                 f"📒 <b>追蹤紀錄</b>：本次新增 <b>{recorded_count}</b> 筆，"
                 f"略過重複 <b>{duplicate_count}</b> 筆，"
-                f"分數略過 <b>{skipped_count}</b> 筆，"
+                f"規則略過 <b>{skipped_count}</b> 筆，"
                 f"失敗 <b>{failed_count}</b> 筆。"
             )
             lines.append("查詢：<code>/oi_log</code>｜統計：<code>/oi_stats</code>")
@@ -2318,8 +2375,12 @@ class Telegram:
             "/top16 - 查看毛年化達標標的\n"
             "/oi - OI 持倉異常狙擊鏡\n"
             "/oi_log - 查看最近 OI 訊號追蹤紀錄\n"
+            "/oi_log_long - 只看 LONG OI 訊號紀錄\n"
+            "/oi_log_short - 只看 SHORT OI 訊號紀錄\n"
             "/oi_stats - 查看 OI 訊號統計\n"
             "/oi_stats SYMBOL - 查看單一交易對 OI 統計\n"
+            "/oi_stats_long - 只看 LONG OI 訊號統計\n"
+            "/oi_stats_short - 只看 SHORT OI 訊號統計\n"
             "/oi_sim - OI 模擬績效\n"
             "/oi_sim_long - 只看 LONG OI 模擬績效\n"
             "/oi_sim_short - 只看 SHORT OI 模擬績效\n"
@@ -2940,7 +3001,7 @@ class Scanner:
 
         lines = [
             "🚨 <b>Funding Radar V2｜正向套利真實淨利版</b>",
-            f"時間：<code>{utc_text()}</code>",
+            f"時間：<code>{display_time_text()}</code>",
             f"PASS：<b>{len(send_pass)}</b>",
             f"WATCH：<b>{len(send_watch)}</b>",
             "",
@@ -3030,7 +3091,7 @@ async def main():
 
         await tg.send(
             "✅ <b>Funding Radar 已啟動</b>\n\n"
-            f"時間：<code>{utc_text()}</code>\n"
+            f"時間：<code>{display_time_text()}</code>\n"
             f"固定追蹤：<code>{','.join(sorted(ALWAYS_TRACK_SYMBOLS))}</code>\n"
             "功能：<code>Funding Radar + OI Radar + OI Signal Tracker</code>\n\n"
             "你可以輸入：<code>/status</code>、<code>/oi</code>、<code>/oi_log</code>、<code>/oi_stats</code> 或 <code>/oi_sim</code>\n"
