@@ -1606,11 +1606,32 @@ class Telegram:
             logger.error(f"send_menu error: {e}")
             return False
 
+    # 允許從按鈕選單觸發的指令白名單。
+    # 只有明確列在此 frozenset 內的 callback_data 才會被送進 handle()。
+    # 未來新增按鈕時，必須同步在此處加入對應的 callback_data，否則按鈕不會有任何作用。
+    MENU_CALLBACK_WHITELIST: frozenset = frozenset({
+        "/status",
+        "/top",
+        "/top16",
+        "/oi",
+        "/oi_log",
+        "/oi_stats",
+        "/oi_sim",
+        "/pause",
+        "/resume",
+    })
+
     async def handle_callback(self, data: str):
         """
         處理 InlineKeyboard 按鈕點擊事件（callback_query）。
-        Grid 即將推出的按鈕單獨處理，其餘全部路由至現有 handle() 指令邏輯。
+
+        安全規則：
+          - /grid_coming_soon 單獨處理，不進 handle()
+          - 只有 MENU_CALLBACK_WHITELIST 內的值才會路由至 handle()
+          - 不在白名單內的 callback_data 一律拒絕，並記錄 warning log
+          - 任何情況下都不會將任意字串直接送進 handle()
         """
+        # ── Grid 即將推出，單獨處理 ──────────────────────────────────
         if data == "/grid_coming_soon":
             await self.send(
                 "🔲 <b>Grid 雷達</b>\n\n"
@@ -1623,8 +1644,14 @@ class Telegram:
             )
             return
 
-        # 所有其他按鈕直接路由至現有指令邏輯
-        await self.handle(data)
+        # ── 白名單檢查：通過才路由至 handle() ───────────────────────
+        if data in self.MENU_CALLBACK_WHITELIST:
+            await self.handle(data)
+            return
+
+        # ── 非白名單：拒絕執行，記錄警告 ────────────────────────────
+        logger.warning(f"handle_callback: 拒絕非白名單 callback_data={repr(data)}")
+        await self.send("⚠️ 無效操作，請重新開啟 <code>/menu</code>。")
 
     async def poll_loop(self):
         if not TELEGRAM_BOT_TOKEN:
