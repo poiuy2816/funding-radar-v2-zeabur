@@ -1525,6 +1525,107 @@ class Telegram:
 
         return score, label
 
+    # =========================
+    # 按鈕選單相關方法
+    # =========================
+
+    async def answer_callback_query(self, callback_query_id: str, text: str = "") -> bool:
+        """
+        呼叫 Telegram answerCallbackQuery API。
+        按鈕點擊後必須呼叫此方法，否則按鈕會持續顯示 loading 狀態。
+        """
+        if not TELEGRAM_BOT_TOKEN:
+            return False
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+        payload: Dict[str, Any] = {"callback_query_id": callback_query_id}
+
+        if text:
+            payload["text"] = text
+
+        try:
+            async with self.session.post(url, json=payload) as resp:
+                return resp.status == 200
+        except Exception as e:
+            logger.warning(f"answerCallbackQuery error: {e}")
+            return False
+
+    async def send_menu(self) -> bool:
+        """
+        發送按鈕式主選單到預設 Chat ID。
+        /start、/menu、/help 均呼叫此方法。
+        """
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            logger.warning("Telegram env 未設定，略過主選單發送")
+            return False
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 系統狀態", "callback_data": "/status"},
+                    {"text": "🏆 Funding 排名", "callback_data": "/top"},
+                ],
+                [
+                    {"text": "🔥 目標達標標的", "callback_data": "/top16"},
+                ],
+                [
+                    {"text": "🎯 OI 掃描", "callback_data": "/oi"},
+                    {"text": "📒 訊號記錄", "callback_data": "/oi_log"},
+                ],
+                [
+                    {"text": "📈 訊號統計", "callback_data": "/oi_stats"},
+                    {"text": "🧪 模擬績效", "callback_data": "/oi_sim"},
+                ],
+                [
+                    {"text": "🔲 Grid 雷達（即將推出）", "callback_data": "/grid_coming_soon"},
+                ],
+                [
+                    {"text": "⏸ 暫停掃描", "callback_data": "/pause"},
+                    {"text": "▶️ 恢復掃描", "callback_data": "/resume"},
+                ],
+            ]
+        }
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": "📋 <b>功能選單</b>｜點擊按鈕快速操作，或直接輸入文字指令。",
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": keyboard,
+        }
+
+        try:
+            async with self.session.post(url, json=payload) as resp:
+                body = await resp.text()
+                if resp.status == 200:
+                    return True
+                logger.error(f"send_menu failed: {body}")
+                return False
+        except Exception as e:
+            logger.error(f"send_menu error: {e}")
+            return False
+
+    async def handle_callback(self, data: str):
+        """
+        處理 InlineKeyboard 按鈕點擊事件（callback_query）。
+        Grid 即將推出的按鈕單獨處理，其餘全部路由至現有 handle() 指令邏輯。
+        """
+        if data == "/grid_coming_soon":
+            await self.send(
+                "🔲 <b>Grid 雷達</b>\n\n"
+                "即將推出，目前尚未啟用。\n\n"
+                "規劃功能：\n"
+                "• 自動評分找出適合掛網格的標的\n"
+                "• 輸出建議網格上下界與格子數量\n"
+                "• 不自動下單，僅供觀察參考\n\n"
+                "敬請期待！"
+            )
+            return
+
+        # 所有其他按鈕直接路由至現有指令邏輯
+        await self.handle(data)
+
     async def poll_loop(self):
         if not TELEGRAM_BOT_TOKEN:
             logger.warning("Telegram token 未設定，不啟動指令監聽")
@@ -1557,6 +1658,24 @@ class Telegram:
         for upd in data.get("result", []):
             self.offset = upd["update_id"] + 1
 
+            # ── 處理按鈕點擊（callback_query）──────────────────────────
+            cb = upd.get("callback_query")
+            if cb:
+                cb_id = cb.get("id", "")
+                cb_chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                cb_data = (cb.get("data") or "").strip()
+
+                # 先呼叫 answerCallbackQuery，消除按鈕 loading 狀態
+                await self.answer_callback_query(cb_id)
+
+                if TELEGRAM_CHAT_ID and cb_chat_id != TELEGRAM_CHAT_ID:
+                    continue
+
+                if cb_data:
+                    await self.handle_callback(cb_data)
+                continue
+
+            # ── 處理一般文字訊息 ────────────────────────────────────────
             msg = upd.get("message") or {}
             chat_id = str(msg.get("chat", {}).get("id", ""))
 
@@ -1577,8 +1696,21 @@ class Telegram:
         cmd = parts[0].lower()
 
         try:
-            if cmd == "/help":
-                await self.send(self.help_text())
+            if cmd in ["/start", "/menu"]:
+                await self.send_menu()
+
+            elif cmd == "/help":
+                await self.send(
+                    "🤖 <b>Funding Radar 指令說明</b>\n\n"
+                    "點擊下方按鈕快速操作，或直接輸入對應文字指令。\n"
+                    "所有文字指令仍然完整可用。\n\n"
+                    f"🎯 目標毛年化：<b>{TARGET_APY * 100:.2f}%</b>\n"
+                    f"💰 目標淨年化：<b>{TARGET_NET_APY * 100:.2f}%</b>\n"
+                    f"⏳ 預估持倉：<b>{EXPECTED_HOLD_DAYS:.0f} 天</b>\n"
+                    f"📌 固定追蹤：<code>{self.h(','.join(sorted(ALWAYS_TRACK_SYMBOLS)))}</code>\n\n"
+                    "詳細指令列表請參考下方選單。"
+                )
+                await self.send_menu()
 
             elif cmd == "/status":
                 await self.cmd_status()
@@ -1664,26 +1796,9 @@ class Telegram:
 
             else:
                 await self.send(
-                    "未知指令，請輸入 /help。\n\n"
-                    "常用：\n"
-                    "<code>/status</code>\n"
-                    "<code>/top</code>\n"
-                    "<code>/rank</code>\n"
-                    "<code>/topnet</code>\n"
-                    "<code>/top16</code>\n"
-                    "<code>/oi</code>\n"
-                    "<code>/oi_log</code>\n"
-                    "<code>/oi_log_long</code>\n"
-                    "<code>/oi_log_short</code>\n"
-                    "<code>/oi_stats</code>\n"
-                    "<code>/oi_stats_long</code>\n"
-                    "<code>/oi_stats_short</code>\n"
-                    "<code>/oi_stats FILUSDT</code>\n"
-                    "<code>/oi_sim</code>\n"
-                    "<code>/oi_sim_long</code>\n"
-                    "<code>/oi_sim_short</code>\n"
-                    "<code>/oi_sim_since 2026-05-12</code>\n"
-                    "<code>/why ETHUSDT</code>"
+                    "未知指令。\n\n"
+                    "輸入 <code>/menu</code> 開啟按鈕選單，\n"
+                    "或輸入 <code>/help</code> 查看完整指令說明。"
                 )
 
         except Exception as e:
